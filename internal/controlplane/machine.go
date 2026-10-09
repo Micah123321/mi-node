@@ -126,8 +126,9 @@ func (p *MachinePanelControlPlane) Discover(
 	return nil, nil
 }
 
-func (p *MachinePanelControlPlane) Report(payload ReportPayload) error {
+func (p *MachinePanelControlPlane) Report(ctx context.Context, payload ReportPayload) error {
 	return p.client.Report(
+		ctx, payload.ReportID,
 		payload.Traffic, payload.Alive, payload.Online,
 		payload.CPU, payload.Mem, payload.Swap, payload.Disk,
 		payload.Metrics,

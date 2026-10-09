@@ -862,6 +862,7 @@ EnvironmentFile=-${CREDENTIALS_FILE}
 ExecStart=${BINARY_PATH} -c ${CONFIG_FILE}
 Restart=always
 RestartSec=5
+TimeoutStopSec=130
 LimitNOFILE=1048576
 NoNewPrivileges=true
 StandardOutput=journal
@@ -1091,28 +1092,112 @@ perform_status() {
     fi
 }
 
-perform_upgrade() {
+# Match updateagent.Lock exactly; never invoke xbctl upgrade while this FD is held.
+# jq parses journals fail-closed and quotes paths. Hashes below describe local
+# recovery bytes, not trusted publisher checksums (legacy manual compatibility).
+upgrade_journal() {
+    local phase="$1" resolved="$2" started="$3" temp
+    temp="$(mktemp "${upgrade_state}/.manual-journal-XXXXXX")"
+    jq --arg phase "${phase}" --argjson resolved "${resolved}" --argjson started "${started}" \
+        '.Phase=$phase | .Resolved=$resolved | .Started=$started' "${upgrade_record}" > "${temp}"
+    chmod 600 "${temp}"
+    sync "${temp}"
+    mv -f "${temp}" "${upgrade_state}/transaction.json"
+    sync "${upgrade_state}"
+}
+
+perform_upgrade() (
     check_root
     ensure_supported_init
     detect_arch
+    local dependency
+    for dependency in flock realpath sha256sum jq sync; do
+        command -v "${dependency}" >/dev/null || { log_error "upgrade requires ${dependency}"; exit 1; }
+    done
+    umask 077
+    local canonical key lock_path upgrade_state upgrade_record claim backup_node backup_cli stage_node stage_cli
+    canonical="$(realpath -e "${BINARY_PATH}")"
+    BINARY_PATH="${canonical}"
+    CLI_PATH="$(realpath -e "${CLI_PATH}")"
+    key="$(printf '%s' "${canonical}" | sha256sum)"
+    key="${key%% *}"
+    lock_path="$(dirname "${canonical}")/.mi-node-update-${key}.lock"
+    [ ! -L "${lock_path}" ] || { log_error "invalid update lock"; exit 1; }
+    exec 9>>"${lock_path}"
+    flock -n 9 || { log_error "update already running"; exit 1; }
+    # Always consult the automatic agent's journal, even with custom install paths.
+    upgrade_state="/etc/mi-node/update-agent"
+    mkdir -p "${upgrade_state}"
+    if [ -e "${upgrade_state}/transaction.json" ]; then
+        jq -e 'type == "object" and .Resolved == true and .Phase != "rollback_failed"' "${upgrade_state}/transaction.json" >/dev/null || {
+            log_error "unresolved or invalid update transaction; recover before upgrading"; exit 1;
+        }
+        # Preserve any unacknowledged automatic result before replacing its journal.
+        if jq -e '(.Pending // []) | length > 0' "${upgrade_state}/transaction.json" >/dev/null; then
+            local pending
+            pending="$(mktemp "${upgrade_state}/pending-manual-XXXXXX.json")"
+            cp "${upgrade_state}/transaction.json" "${pending}"
+            sync "${pending}"
+            sync "${upgrade_state}"
+        fi
+    fi
     detect_current_state
     TMP_DIR="$(mktemp -d)"
-    ensure_dirs
+    trap cleanup EXIT
     stage_binary
     stage_xbctl
-    backup_existing_state
-    install -m 755 "${TMP_DIR}/mi-node" "${BINARY_PATH}"
-    if [ "${HAVE_XBCTL}" -eq 1 ]; then
-        install -m 755 "${TMP_DIR}/xbctl" "${CLI_PATH}"
-        ln -sf "${CLI_PATH}" /usr/bin/xbctl 2>/dev/null || true
+    "${TMP_DIR}/mi-node" -v >/dev/null
+    "${TMP_DIR}/xbctl" version >/dev/null
+    claim="manual-$(date +%s)-$$-${RANDOM}"
+    backup_node="${BINARY_PATH}.backup-${claim}"
+    backup_cli="${CLI_PATH}.backup-${claim}"
+    stage_node="$(mktemp "$(dirname "${BINARY_PATH}")/.mi-node-manual-XXXXXX")"
+    stage_cli="$(mktemp "$(dirname "${CLI_PATH}")/.xbctl-manual-XXXXXX")"
+    install -m 755 "${TMP_DIR}/mi-node" "${stage_node}"
+    install -m 755 "${TMP_DIR}/xbctl" "${stage_cli}"
+    upgrade_record="${TMP_DIR}/transaction.json"
+    jq -n --arg claim "${claim}" --arg version "${RELEASE_VERSION}" \
+        --arg node "${BINARY_PATH}" --arg cli "${CLI_PATH}" \
+        --arg ns "${stage_node}" --arg cs "${stage_cli}" \
+        --arg nb "${backup_node}" --arg cb "${backup_cli}" \
+        --arg no "$(sha256sum "${BINARY_PATH}" | cut -d ' ' -f 1)" \
+        --arg co "$(sha256sum "${CLI_PATH}" | cut -d ' ' -f 1)" \
+        --arg nn "$(sha256sum "${stage_node}" | cut -d ' ' -f 1)" \
+        --arg cn "$(sha256sum "${stage_cli}" | cut -d ' ' -f 1)" \
+        '{ClaimID:$claim,Manual:true,TargetVersion:$version,Files:[
+          {Path:$node,Stage:$ns,Backup:$nb,OldSHA:$no,NewSHA:$nn},
+          {Path:$cli,Stage:$cs,Backup:$cb,OldSHA:$co,NewSHA:$cn}]}' > "${upgrade_record}"
+    upgrade_journal preparing false false
+    cp -p "${BINARY_PATH}" "${backup_node}"
+    cp -p "${CLI_PATH}" "${backup_cli}"
+    sync "${backup_node}" "${backup_cli}" "${stage_node}" "${stage_cli}"
+    sync "$(dirname "${BINARY_PATH}")" "$(dirname "${CLI_PATH}")"
+    upgrade_journal installing false true
+    local failed=0
+    mv -f "${stage_node}" "${BINARY_PATH}" || failed=1
+    if [ "${failed}" -eq 0 ]; then mv -f "${stage_cli}" "${CLI_PATH}" || failed=1; fi
+    sync "$(dirname "${BINARY_PATH}")" "$(dirname "${CLI_PATH}")"
+    if [ "${failed}" -eq 0 ] && [ "${SERVICE_WAS_ACTIVE}" -eq 1 ]; then
+        service_restart && service_is_active || failed=1
     fi
-    if [ "${SERVICE_WAS_ACTIVE}" -eq 1 ]; then
-        service_restart
-        log_info "服务已重启: ${SERVICE_NAME}"
-    else
-        log_info "服务当前未运行，已仅更新二进制"
+    if [ "${failed}" -ne 0 ]; then
+        upgrade_journal rolling_back false true
+        # Copy to sibling files before rename; never overwrite running executables.
+        cp -p "${backup_node}" "${stage_node}"
+        cp -p "${backup_cli}" "${stage_cli}"
+        sync "${stage_node}" "${stage_cli}"
+        mv -f "${stage_node}" "${BINARY_PATH}"
+        mv -f "${stage_cli}" "${CLI_PATH}"
+        sync "$(dirname "${BINARY_PATH}")" "$(dirname "${CLI_PATH}")"
+        if [ "${SERVICE_WAS_ACTIVE}" -eq 1 ]; then service_restart && service_is_active || exit 1; fi
+        upgrade_journal rolled_back true true
+        log_error "upgrade failed; both binaries restored"
+        exit 1
     fi
-}
+    upgrade_journal succeeded true true
+    ln -sf "${CLI_PATH}" /usr/bin/xbctl 2>/dev/null || true
+    log_info "升级完成；事务和回滚副本已保留"
+)
 
 perform_uninstall() {
     check_root

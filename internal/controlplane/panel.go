@@ -106,8 +106,8 @@ func (p *PanelControlPlane) Discover(ctx context.Context, metricsFn func() map[s
 	return nil, nil
 }
 
-func (p *PanelControlPlane) Report(payload ReportPayload) error {
-	return p.client.Report(payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
+func (p *PanelControlPlane) Report(ctx context.Context, payload ReportPayload) error {
+	return p.client.Report(ctx, payload.ReportID, payload.Traffic, payload.Alive, payload.Online, payload.CPU, payload.Mem, payload.Swap, payload.Disk, payload.Metrics)
 }
 
 func (p *PanelControlPlane) GFWTask(ctx context.Context) (*gfwcheck.Task, error) {

@@ -52,14 +52,15 @@ type Snapshot struct {
 }
 
 type ReportPayload struct {
-	Traffic map[int][2]int64
-	Alive   map[int][]string
-	Online  map[int]int
-	CPU     float64
-	Mem     [2]uint64
-	Swap    [2]uint64
-	Disk    [2]uint64
-	Metrics map[string]interface{}
+	ReportID string
+	Traffic  map[int][2]int64
+	Alive    map[int][]string
+	Online   map[int]int
+	CPU      float64
+	Mem      [2]uint64
+	Swap     [2]uint64
+	Disk     [2]uint64
+	Metrics  map[string]interface{}
 }
 
 type PushClient interface {
@@ -79,7 +80,7 @@ type Source interface {
 }
 
 type Sink interface {
-	Report(payload ReportPayload) error
+	Report(ctx context.Context, payload ReportPayload) error
 	ReportDevices(push PushClient, devices map[int][]string)
 	ReportGFWCheck(ctx context.Context, report gfwcheck.Report) error
 	SupportsReporting() bool

@@ -46,9 +46,10 @@ type SingBox struct {
 	tls        kernel.TLSCert
 
 	// connTracker is our lightweight in-process byte/IP tracker.
-	// Created fresh on every Start (full restart).
-	// Survives Reload (hot-swap) since live connections persist.
+	// Shared across instances so draining old connections keep contributing
+	// to the same cumulative counters after Start and Reload.
 	connTracker *ConnTracker
+	recycleWG   sync.WaitGroup
 
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	// Set once by SetSpeedLimitFunc and forwarded to every new ConnTracker.
@@ -129,7 +130,29 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		return fmt.Errorf("create sing-box instance: %w", err)
 	}
 
+	// Attach before listeners start, and retain counters shared by draining instances.
+	if s.connTracker == nil {
+		s.connTracker = NewConnTracker(0)
+		s.connTracker.SetDisableDeviceGate(s.cfg.LowJitterDisableDeviceGate)
+	}
+	combined := append(append([]model.UserSpec(nil), s.users...), users...)
+	s.connTracker.SetUserMap(buildUserMap(combined))
+	if s.speedLimitFunc != nil {
+		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
+	}
+	if s.deviceLimitFunc != nil {
+		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
+	}
+	router := service.FromContext[adapter.Router](ctx)
+	if router == nil {
+		_ = instance.Close()
+		cancel()
+		s.connTracker.SetUserMap(buildUserMap(s.users))
+		return fmt.Errorf("traffic tracker: router not available")
+	}
+	router.AppendTracker(s.connTracker)
 	if err := instance.Start(); err != nil {
+		s.connTracker.SetUserMap(buildUserMap(s.users))
 		instance.Close()
 		cancel()
 		return fmt.Errorf("start sing-box: %w", err)
@@ -143,23 +166,16 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.nodeConfig = nodeConfig
 	s.tls = tls
 
-	// Fresh tracker on full restart.
-	s.connTracker = NewConnTracker(0)
-	s.connTracker.SetDisableDeviceGate(s.cfg.LowJitterDisableDeviceGate)
+	s.trackerRegistered = true
 	s.connTracker.SetUserMap(buildUserMap(users))
-	if s.speedLimitFunc != nil {
-		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
-	}
-	if s.deviceLimitFunc != nil {
-		s.connTracker.SetDeviceLimitFunc(s.deviceLimitFunc)
-	}
-
-	s.trackerRegistered = false
-	s.registerTracker(ctx)
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
-		go recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+		s.recycleWG.Add(1)
+		go func() {
+			defer s.recycleWG.Done()
+			recycleOldBox(oldBox, oldCancel, oldCtx, oldTracker)
+		}()
 	}
 
 	nlog.Core().Debug("sing-box started", "users", len(users))
@@ -342,8 +358,9 @@ func (s *SingBox) registerTracker(ctx context.Context) {
 
 func (s *SingBox) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.stop()
+	s.mu.Unlock()
+	s.recycleWG.Wait()
 }
 
 func (s *SingBox) stop() {

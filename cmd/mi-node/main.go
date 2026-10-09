@@ -18,7 +18,9 @@ import (
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/machine"
 	"github.com/micah123321/mi-node/internal/nlog"
+	"github.com/micah123321/mi-node/internal/readiness"
 	"github.com/micah123321/mi-node/internal/service"
+	"github.com/micah123321/mi-node/internal/updateagent"
 )
 
 var (
@@ -89,6 +91,10 @@ func newDebugMux(statuses func() []service.EgressDebugStatus) *http.ServeMux {
 }
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "version" && os.Args[2] == "--json" {
+		_ = updateagent.PrintVersion(version)
+		return
+	}
 	configPath := flag.String("c", "config.yml", "config file path")
 	showVersion := flag.Bool("v", false, "show version")
 	flag.Parse()
@@ -217,6 +223,19 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		)
 
 		ctx, cancel := context.WithCancel(context.Background())
+		ctx, readyRegistry := readiness.New(ctx, version)
+		for _, cfg := range instances {
+			if cfg.IsMachineMode() {
+				readiness.Set(ctx, readiness.Key(cfg.InstanceID, cfg.Panel.URL, 0), false)
+			} else {
+				for _, node := range cfg.ExpandNodes() {
+					readiness.Set(ctx, readiness.Key(node.InstanceID, node.Panel.URL, node.Panel.NodeID), false)
+				}
+			}
+		}
+		if err := readyRegistry.Publish(ctx, updateagent.ReadinessPath); err != nil {
+			nlog.Core().Warn("readiness unavailable", "error", err)
+		}
 		reloadCh := make(chan *config.RootConfig, 1)
 
 		watcher, err := config.WatchConfigRoot(ctx, configPath, func(newRoot *config.RootConfig) {
@@ -242,8 +261,8 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 				case sig = <-sigCh:
 					nlog.Core().Warn("received second signal, forcing exit", "signal", sig)
 					os.Exit(1)
-				case <-time.After(15 * time.Second):
-					nlog.Core().Error("shutdown timed out after 15s, forcing exit")
+				case <-time.After(service.ShutdownReportTimeout + 30*time.Second):
+					nlog.Core().Error("shutdown timed out after 120s, forcing exit")
 					os.Exit(2)
 				}
 			case <-ctx.Done():
@@ -281,7 +300,10 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 							"instance", instanceCfg.InstanceID,
 							"error", err,
 						)
-						errCh <- err
+						select {
+						case errCh <- err:
+						default:
+						} // Retain at least one failure without blocking other shutdowns.
 						cancel()
 					}
 					return
@@ -318,7 +340,10 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 								"node_id", nodeCfg.Panel.NodeID,
 								"error", err,
 							)
-							errCh <- err
+							select {
+							case errCh <- err:
+							default:
+							} // Retain at least one failure without blocking other shutdowns.
 							cancel()
 						} else {
 							nlog.Core().Info("node service stopped",
@@ -354,11 +379,11 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		}
 		cancel()
 
+		close(errCh)
+		if err := firstError(errCh); err != nil {
+			os.Exit(1)
+		}
 		if newRoot == nil {
-			close(errCh)
-			if err := firstError(errCh); err != nil {
-				os.Exit(1)
-			}
 			nlog.Core().Info("mi-node stopped")
 			return
 		}

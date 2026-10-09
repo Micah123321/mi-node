@@ -37,8 +37,7 @@ import (
 )
 
 const (
-	// drainTimeout is how long Stop waits for in-flight connections to finish
-	// before hard-killing the instance. Skipped during hot-reload for speed.
+	// drainTimeout bounds connection draining for Stop and instance replacement.
 	drainTimeout = 5 * time.Second
 	// startTimeout caps how long instance.Start() may block.
 	startTimeout = 30 * time.Second
@@ -67,6 +66,7 @@ type Xray struct {
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
+	statsUsers      map[int]struct{} // includes removed users until this instance closes
 	speedLimitFunc  func(string) *rate.Limiter
 
 	// running is set after a successful Start and cleared before shutdown.
@@ -104,17 +104,9 @@ func (x *Xray) Protocols() []string {
 
 // ─── Lifecycle ──────────────────────────────────────────────────────────────
 
-// Start builds a new xray-core instance and atomically replaces the old
-// one. The method is organised in five non-overlapping phases so that the
-// kernel mutex is never held during slow operations (Start / Close).
-// Crucially, the old instance stays alive until the new one is confirmed
-// running — if StartNew fails, the old instance is untouched.
-//
-//	Phase 1 – Build:   generate protobuf config  (no lock, pure computation)
-//	Phase 2 – Create:  xrayCore.New + capture LD (brief global lock)
-//	Phase 3 – Swap:    stop old instance          (brief kernel lock)
-//	Phase 4 – Start:   instance.Start             (no lock, potentially slow)
-//	Phase 5 – Commit:  store new state            (brief kernel lock)
+// Start starts the replacement before closing the old instance. Old counters
+// are sampled after bounded draining and added to service-lifetime totals.
+// A failed replacement leaves the old instance and counters untouched.
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	if err := kernel.ValidateShadowsocks2022Credentials(nodeConfig, users); err != nil {
 		return err
@@ -148,10 +140,15 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 		return err
 	}
 
-	// ── Phase 4: Swap old → new (brief kernel lock) ─────────────────────
+	// Close and sample the old instance before publishing the replacement.
 	x.mu.Lock()
 	old := x.instance
 	oldLD := x.limitDispatcher
+	x.mu.Unlock()
+	closeOld(old, oldLD)
+	x.mu.Lock()
+	_, _ = x.aggregateStats()
+	x.statsUsers = nil
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -159,13 +156,12 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
 	x.inboundTag = nodeConfig.Protocol + "-in"
-	x.cumTraffic = make(map[int][2]int64)
+	if x.cumTraffic == nil {
+		x.cumTraffic = make(map[int][2]int64)
+	}
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)
 	x.mu.Unlock()
-
-	// ── Phase 5: Recycle old (background, non-blocking) ─────────────────
-	closeOld(old, oldLD)
 
 	x.updateDispatcherLimits(users)
 	x.updateBandwidthLimits(users)
@@ -208,14 +204,14 @@ func (x *Xray) Stop() {
 	x.mu.Lock()
 	inst := x.instance
 	ld := x.limitDispatcher
+	x.mu.Unlock()
+	closeOld(inst, ld)
+	x.mu.Lock()
+	_, _ = x.aggregateStats()
 	x.instance = nil
 	x.limitDispatcher = nil
+	x.statsUsers = nil
 	x.mu.Unlock()
-
-	if ld != nil {
-		drainConns(ld, drainTimeout)
-	}
-	closeOld(inst, ld)
 }
 
 func (x *Xray) IsRunning() bool { return x.running.Load() }
@@ -231,10 +227,6 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 // available. The dispatcher intentionally no longer wraps transport links,
 // so traffic accounting must come from xray-core itself.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
-	if !x.running.Load() {
-		return nil, nil, 0, nil
-	}
-
 	x.mu.Lock()
 	ld := x.limitDispatcher
 	traffic, err = x.aggregateStats()
@@ -378,6 +370,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		x.mu.Unlock()
 		return 0, fmt.Errorf("not running")
 	}
+	_, _ = x.aggregateStats()
 	removeSet := make(map[int]struct{}, len(users))
 	for _, u := range users {
 		removeSet[u.ID] = struct{}{}
@@ -444,6 +437,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		x.mu.Unlock()
 		return 0, 0, fmt.Errorf("not running")
 	}
+	_, _ = x.aggregateStats()
 	toAdd, toRemove := kernel.UserDiff(x.users, users)
 	added, removed = len(toAdd), len(toRemove)
 
@@ -747,31 +741,25 @@ func startWithTimeout(inst *xrayCore.Instance, timeout time.Duration) error {
 	}
 }
 
-// closeOld shuts down a previously running instance and its dispatcher.
-// Recycling happens in a background goroutine to prevent the main thread
-// from blocking on slow connection draining, enabling "hitless" reload.
+// closeOld completes bounded draining before the caller takes the final sample.
 func closeOld(inst *xrayCore.Instance, ld *LimitDispatcher) {
 	if inst == nil {
 		return
 	}
-	go func() {
-		// 1. Drain connections gracefully (best effort, e.g. 5 minutes)
-		// We use a much longer timeout here than the default Stop() because
-		// it's running in background and doesn't block new user connections.
-		if ld != nil {
-			drainConns(ld, 5*time.Minute)
-		}
-		// 2. Hard close
-		inst.Close()
-		if ld != nil {
-			ld.ResetConns()
-		}
-		nlog.Core().Debug("xray: old instance recycled")
-	}()
+	if im, ok := inst.GetFeature(inbound.ManagerType()).(inbound.Manager); ok {
+		_ = im.Close()
+	}
+	if ld != nil {
+		drainConns(ld, drainTimeout)
+	}
+	_ = inst.Close()
+	if ld != nil {
+		ld.ResetConns()
+	}
 }
 
 // drainConns waits up to timeout for the dispatcher's active connections to
-// reach zero. Used only during graceful Stop, not during hot-reload.
+// reach zero before closing the old instance.
 func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -782,40 +770,36 @@ func drainConns(ld *LimitDispatcher, timeout time.Duration) {
 	}
 }
 
-// aggregateStats is a fallback path that reads xray's built-in stats counters
-// when LimitDispatcher is not available. Returns per-user cumulative traffic.
+// aggregateStats drains built-in counters into service-lifetime cumulative totals.
+// Removed users remain tracked because previously admitted connections may write.
 // Must be called with x.mu held.
 func (x *Xray) aggregateStats() (map[int][2]int64, error) {
-	sm := x.instance.GetFeature(stats.ManagerType())
-	if sm == nil {
-		return nil, nil
+	if x.cumTraffic == nil {
+		x.cumTraffic = make(map[int][2]int64)
 	}
-	mgr, ok := sm.(stats.Manager)
-	if !ok {
-		return nil, nil
+	if x.statsUsers == nil {
+		x.statsUsers = make(map[int]struct{})
 	}
-
-	traffic := make(map[int][2]int64)
 	for _, u := range x.users {
-		email := userEmail(u.ID)
-
-		var dUp, dDown int64
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>uplink", email)); c != nil {
-			dUp = c.Set(0)
+		x.statsUsers[u.ID] = struct{}{}
+	}
+	if x.instance != nil {
+		if mgr, ok := x.instance.GetFeature(stats.ManagerType()).(stats.Manager); ok {
+			for uid := range x.statsUsers {
+				cum := x.cumTraffic[uid]
+				for i, direction := range []string{"uplink", "downlink"} {
+					if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>%s", userEmail(uid), direction)); c != nil {
+						cum[i] += c.Set(0)
+					}
+				}
+				x.cumTraffic[uid] = cum
+			}
 		}
-		if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>downlink", email)); c != nil {
-			dDown = c.Set(0)
-		}
-
-		if dUp > 0 || dDown > 0 {
-			cum := x.cumTraffic[u.ID]
-			cum[0] += dUp
-			cum[1] += dDown
-			x.cumTraffic[u.ID] = cum
-		}
-
-		if cum := x.cumTraffic[u.ID]; cum[0] > 0 || cum[1] > 0 {
-			traffic[u.ID] = cum
+	}
+	traffic := make(map[int][2]int64, len(x.cumTraffic))
+	for uid, cum := range x.cumTraffic {
+		if cum[0] > 0 || cum[1] > 0 {
+			traffic[uid] = cum
 		}
 	}
 	return traffic, nil

@@ -15,6 +15,7 @@ import (
 	"github.com/micah123321/mi-node/internal/monitor"
 	"github.com/micah123321/mi-node/internal/nlog"
 	"github.com/micah123321/mi-node/internal/panel"
+	"github.com/micah123321/mi-node/internal/readiness"
 	"github.com/micah123321/mi-node/internal/service"
 )
 
@@ -34,8 +35,9 @@ type Orchestrator struct {
 	cfg    *config.Config
 	client *panel.Client // machine-level client (no node_id)
 
-	mu    sync.Mutex
-	nodes map[int]*nodeHandle // node_id → handle
+	mu      sync.Mutex
+	nodes   map[int]*nodeHandle // node_id → handle
+	nodeErr error               // first service failure, protected by mu
 
 	// Per-node mailbox keyed by node_id. Shared WS events are aggregated here
 	// and each node service drains the latest state when ready.
@@ -74,6 +76,9 @@ func New(cfg *config.Config) *Orchestrator {
 // Run is the main loop. It blocks until ctx is cancelled.
 func (o *Orchestrator) Run(ctx context.Context) error {
 	o.runCtx = ctx
+	readyKey := readiness.Key(o.cfg.InstanceID, o.cfg.Panel.URL, 0)
+	readiness.Set(ctx, readyKey, false)
+	defer readiness.Set(ctx, readyKey, false)
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
@@ -92,6 +97,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		o.startNode(ctx, n)
 	}
 
+	readiness.Set(ctx, readyKey, true)
 	discoveryTicker := time.NewTicker(o.pullInterval)
 	statusTicker := time.NewTicker(o.pushInterval)
 	defer discoveryTicker.Stop()
@@ -100,8 +106,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			o.stopAll()
-			return nil
+			return o.stopAll()
 
 		case <-discoveryTicker.C:
 			o.rediscover(ctx)
@@ -132,6 +137,7 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 	o.eventsMu.Unlock()
 
 	nodeCfg := o.cfg.ExpandMachineNode(mn.ID, mn.Type)
+	readiness.Set(ctx, readiness.Key(nodeCfg.InstanceID, nodeCfg.Panel.URL, nodeCfg.Panel.NodeID), false)
 
 	perNodeClient := o.client.ForNode(mn.ID)
 
@@ -174,6 +180,11 @@ func (o *Orchestrator) startNode(ctx context.Context, mn panel.MachineNode) {
 		defer close(done)
 		defer o.unregisterNode(mn.ID)
 		if err := svc.Run(nodeCtx); err != nil {
+			o.mu.Lock()
+			if o.nodeErr == nil {
+				o.nodeErr = fmt.Errorf("node %d: %w", mn.ID, err)
+			}
+			o.mu.Unlock()
 			nlog.Core().Error("machine node exited with error",
 				"node_id", mn.ID, "error", err)
 		}
@@ -199,7 +210,7 @@ func (o *Orchestrator) stopNode(nodeID int) {
 	<-h.done
 }
 
-func (o *Orchestrator) stopAll() {
+func (o *Orchestrator) stopAll() error {
 	o.mu.Lock()
 	handles := make(map[int]*nodeHandle, len(o.nodes))
 	for id, h := range o.nodes {
@@ -218,6 +229,9 @@ func (o *Orchestrator) stopAll() {
 	if o.wsCancel != nil {
 		o.wsCancel()
 	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.nodeErr
 }
 
 // ─── Node discovery ──────────────────────────────────────────────────────
@@ -245,6 +259,7 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 
 	for _, id := range toRemove {
 		o.stopNode(id)
+		readiness.Remove(ctx, readiness.Key(o.cfg.InstanceID, o.cfg.Panel.URL, id))
 	}
 
 	for _, n := range nodesResp.Nodes {

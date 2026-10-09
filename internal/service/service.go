@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,9 +32,13 @@ import (
 	"github.com/micah123321/mi-node/internal/model"
 	"github.com/micah123321/mi-node/internal/monitor"
 	"github.com/micah123321/mi-node/internal/nlog"
+	"github.com/micah123321/mi-node/internal/readiness"
 	"github.com/micah123321/mi-node/internal/tracker"
 	"github.com/micah123321/mi-node/internal/trafficlimit"
 )
+
+// ShutdownReportTimeout includes the in-flight report, kernel drain and final send.
+const ShutdownReportTimeout = 90 * time.Second
 
 type Service struct {
 	cfg          *config.Config
@@ -68,6 +74,12 @@ type Service struct {
 
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive     atomic.Bool
+	reportMu       sync.Mutex // admission only; never held during HTTP
+	reportWG       sync.WaitGroup
+	reportStopping bool
+	pendingReport  *controlplane.ReportPayload
+	reportQueue    []*controlplane.ReportPayload
+	spoolLoaded    bool
 	pullActive     atomic.Bool
 	gfwCheckActive atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
@@ -185,6 +197,14 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) error {
+	readyKey := readiness.Key(s.cfg.InstanceID, s.cfg.Panel.URL, s.cfg.Panel.NodeID)
+	readiness.Set(ctx, readyKey, false)
+	defer readiness.Set(ctx, readyKey, false)
+	if s.sink.SupportsReporting() {
+		if err := s.loadReportSpool(); err != nil {
+			return err
+		}
+	}
 	// Start cert manager (handles auto-TLS or manual cert verification)
 	if err := s.cert.Start(ctx); err != nil {
 		return fmt.Errorf("cert manager: %w", err)
@@ -221,10 +241,12 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startWSClient(ctx)
 
 	for {
+		// A nil machine snapshot is not initialized, even when its WS loop is running.
+		initialized := s.lastConfig != nil && (s.kernel.IsRunning() || len(s.lastUsers) == 0 || (s.trafficLimit != nil && !s.trafficLimit.CanRun()))
+		readiness.Set(ctx, readyKey, initialized)
 		select {
 		case <-ctx.Done():
-			s.pushReportSync()
-			return nil
+			return s.shutdownReports()
 
 		case <-trackTicker.C:
 			s.trackAndEnforce(ctx)
@@ -1220,10 +1242,6 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 		s.handleTrafficLimitAction(action)
 	}
 
-	if !s.kernel.IsRunning() {
-		return
-	}
-
 	traffic, aliveIPs, connCount, err := s.kernel.GetUserTraffic(ctx)
 	if err != nil {
 		nlog.Core().Debug("get user traffic failed", "error", err)
@@ -1249,62 +1267,129 @@ func (s *Service) trackAndEnforce(ctx context.Context) {
 	}
 }
 
-// pushReportAsync sends the report in a background goroutine so the select
-// loop is never blocked by slow HTTP. Only one push runs at a time.
-func (s *Service) pushReportAsync() {
-	if !s.sink.SupportsReporting() {
-		return
+// Only the admitted report worker owns pendingReport. A retry never drains
+// tracker traffic: bytes collected meanwhile belong to a different batch.
+func (s *Service) prepareReport() error {
+	if err := s.loadReportSpool(); err != nil {
+		return err
 	}
-	if !s.pushActive.CompareAndSwap(false, true) {
-		nlog.Core().Debug("push already in progress, skipping")
-		return
+	if s.pendingReport == nil {
+		if err := s.appendReport(); err != nil {
+			return err
+		}
 	}
-	if s.pushBackoff.shouldSkip() {
-		nlog.Core().Debug("skipping report due to backoff")
-		s.pushActive.Store(false)
-		return
-	}
+	return s.persistReportQueue(s.reportQueue)
+}
 
-	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
+func (s *Service) appendReport() error {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return fmt.Errorf("report ID: %w", err)
+	}
 	status := monitor.Collect()
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
+	alive := s.tracker.FlushAliveIPs()
+	payload := &controlplane.ReportPayload{
+		ReportID: fmt.Sprintf("%x", id), Traffic: s.tracker.FlushTraffic(),
+		Alive: alive, Online: s.tracker.CurrentOnline(), CPU: status.CPU,
+		Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed},
+		Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics,
+	}
+	s.reportQueue = append(s.reportQueue, payload)
+	if s.pendingReport == nil {
+		s.pendingReport = payload
+	}
+	return nil
+}
 
+func (s *Service) sendReport(ctx context.Context) error {
+	if err := s.prepareReport(); err != nil {
+		return err
+	}
+	if err := s.sink.Report(ctx, *s.pendingReport); err != nil {
+		return err
+	}
+	if err := s.persistReportQueue(s.reportQueue[1:]); err != nil {
+		return fmt.Errorf("acknowledge report spool: %w", err)
+	}
+	s.reportQueue = s.reportQueue[1:]
+	s.pendingReport = nil
+	if len(s.reportQueue) > 0 {
+		s.pendingReport = s.reportQueue[0]
+	}
+	return nil
+}
+
+func (s *Service) pushReportAsync() {
+	s.reportMu.Lock()
+	defer s.reportMu.Unlock()
+	if s.reportStopping || !s.sink.SupportsReporting() || !s.pushActive.CompareAndSwap(false, true) {
+		return
+	}
+	if s.pushBackoff.shouldSkip() {
+		s.pushActive.Store(false)
+		return
+	}
+	s.reportWG.Add(1)
 	go func() {
+		defer s.reportWG.Done()
 		defer s.pushActive.Store(false)
-		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-			nlog.Core().Error("failed to push report", "error", err)
-			if len(traffic) > 0 {
-				s.tracker.RestoreTraffic(traffic)
-			}
-			if len(aliveIPs) > 0 {
-				s.tracker.RestoreAliveIPs(aliveIPs)
-			}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := s.sendReport(ctx); err != nil {
+			nlog.Core().Error("failed to push report; retaining batch", "error", err)
 			s.pushBackoff.onFailure()
 			return
 		}
 		s.pushBackoff.onSuccess()
-		nlog.ReportPushed(len(traffic), len(online))
 	}()
 }
 
-// pushReportSync is used only during shutdown to ensure final data is sent.
-func (s *Service) pushReportSync() {
+func (s *Service) shutdownReports() error {
+	s.reportMu.Lock()
+	s.reportStopping = true
+	s.reportMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), ShutdownReportTimeout)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { s.reportWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return fmt.Errorf("wait for in-flight report: %w", ctx.Err())
+	}
+	// Stop drains old and current instances; cumulative counters remain readable.
+	s.kernel.Stop()
+	traffic, alive, count, err := s.kernel.GetUserTraffic(ctx)
+	var sampleErr error
+	if err != nil {
+		sampleErr = fmt.Errorf("final traffic sample: %w", err)
+	} else {
+		s.tracker.Process(traffic, alive, count)
+	}
 	if !s.sink.SupportsReporting() {
-		return
+		return sampleErr
 	}
-	traffic := s.tracker.FlushTraffic()
-	aliveIPs := s.tracker.FlushAliveIPs()
-	online := s.tracker.CurrentOnline()
-	status := monitor.Collect()
-	metrics := s.buildMetrics(status)
-	metrics["kernel_status"] = s.kernel.IsRunning()
-
-	if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
-		nlog.Core().Warn("failed to push final report", "error", err)
+	if err := s.loadReportSpool(); err != nil {
+		return errors.Join(sampleErr, err)
 	}
+	// Persist the separate tail before any retry. Hard kills before this snapshot
+	// can still lose live bytes collected since the last durable batch.
+	if s.tracker.HasTraffic() || s.pendingReport == nil {
+		if err := s.appendReport(); err != nil {
+			return errors.Join(sampleErr, err)
+		}
+	}
+	if err := s.persistReportQueue(s.reportQueue); err != nil {
+		return errors.Join(sampleErr, err)
+	}
+	for s.pendingReport != nil {
+		if err := s.sendReport(ctx); err != nil {
+			return errors.Join(sampleErr, fmt.Errorf("final report failed; retaining unacknowledged batches: %w", err))
+		}
+	}
+	return sampleErr
 }
 
 // buildMetrics aggregates node-level metrics to be reported to the panel.

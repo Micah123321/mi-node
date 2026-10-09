@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"time"
 
 	"github.com/micah123321/mi-node/internal/config"
+	"github.com/micah123321/mi-node/internal/updateagent"
 	"gopkg.in/yaml.v3"
 )
 
@@ -192,11 +192,16 @@ func run(args []string) error {
 		return runBind(append([]string{"remove-machine"}, args[1:]...))
 	case "start", "stop", "restart", "enable", "disable":
 		return runService(args)
+	case "update-agent":
+		return runUpdateAgent(args[1:])
 	case "upgrade":
 		return runUpgrade(args[1:])
 	case "uninstall":
 		return runUninstall(args[1:])
 	case "version", "-v", "--version":
+		if len(args) == 2 && args[1] == "--json" {
+			return updateagent.PrintVersion(version)
+		}
 		fmt.Printf("xbctl %s (built %s)\n", version, buildTime)
 		return nil
 	case "config":
@@ -228,7 +233,9 @@ func printUsage() {
   xbctl egress list [--output text|json]
   xbctl egress set --node-id ID (--socks5-url URL | --socks5 HOST:PORT | --shadowsocks-uri URI) [--no-restart]
   xbctl egress clear --node-id ID [--no-restart]
-  xbctl upgrade [--version VERSION]
+  xbctl upgrade [--version VERSION | --recover]
+  xbctl update-agent install --authority-panel-url URL --enrollment-file PATH
+  xbctl update-agent run|status|disable
   xbctl uninstall [--purge] [--yes]
   xbctl version
 
@@ -400,121 +407,11 @@ func runUpgrade(args []string) error {
 		return err
 	}
 
-	version := "latest"
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--version" && i+1 < len(args) {
-			version = args[i+1]
-			i++
-		}
+	if err := executeManualUpgrade(args); err != nil {
+		return err
 	}
-
-	arch := runtime.GOARCH
-	if arch != "amd64" && arch != "arm64" {
-		return fmt.Errorf("unsupported architecture: %s", arch)
-	}
-
-	fmt.Println("Starting upgrade...")
-
-	binaryDir := filepath.Dir(defaultBinaryPath)
-	cliDir := filepath.Dir(defaultCLIPath)
-	newBinary := filepath.Join(binaryDir, ".mi-node.new")
-	newCLI := filepath.Join(cliDir, ".xbctl.new")
-
-	binaryURL := resolveDownloadURL(fmt.Sprintf("mi-node-linux-%s", arch), version)
-	cliURL := resolveDownloadURL(fmt.Sprintf("xbctl-linux-%s", arch), version)
-
-	fmt.Printf("Downloading %s...\n", binaryURL)
-	if err := downloadFile(binaryURL, newBinary); err != nil {
-		return fmt.Errorf("download binary: %w", err)
-	}
-
-	fmt.Printf("Downloading %s...\n", cliURL)
-	if err := downloadFile(cliURL, newCLI); err != nil {
-		os.Remove(newBinary)
-		return fmt.Errorf("download xbctl: %w", err)
-	}
-
-	if err := os.Chmod(newBinary, 0o755); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod binary: %w", err))
-	}
-	if err := os.Chmod(newCLI, 0o755); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("chmod xbctl: %w", err))
-	}
-
-	// Validate downloaded binaries
-	if out, err := exec.Command(newBinary, "-v").CombinedOutput(); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("binary version check failed: %s", string(out)))
-	}
-	if out, err := exec.Command(newCLI, "version").CombinedOutput(); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("xbctl version check failed: %s", string(out)))
-	}
-
-	// Backup existing binaries
-	backupBinary := defaultBinaryPath + ".bak"
-	backupCLI := defaultCLIPath + ".bak"
-	// Backup existing binaries
-	if fileExists(defaultBinaryPath) {
-		if err := copyFile(defaultBinaryPath, backupBinary); err != nil {
-			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup binary: %w", err))
-		}
-	}
-	if fileExists(defaultCLIPath) {
-		if err := copyFile(defaultCLIPath, backupCLI); err != nil {
-			return cleanupFiles(newBinary, newCLI, fmt.Errorf("backup xbctl: %w", err))
-		}
-	}
-
-	// Atomic rename
-	if err := os.Rename(newBinary, defaultBinaryPath); err != nil {
-		return cleanupFiles(newBinary, newCLI, fmt.Errorf("replace binary: %w", err))
-	}
-	if err := os.Rename(newCLI, defaultCLIPath); err != nil {
-		if fileExists(backupBinary) {
-			os.Rename(backupBinary, defaultBinaryPath)
-		}
-		os.Remove(newCLI)
-		return fmt.Errorf("replace xbctl: %w", err)
-	}
-
-	// Recreate /usr/bin/xbctl symlink
 	os.Remove("/usr/bin/xbctl")
 	os.Symlink(defaultCLIPath, "/usr/bin/xbctl")
-
-	// Restart service
-	fmt.Println("Restarting service...")
-	if detectInitSystem() == initSystemSystemd {
-		runCommand("systemctl", "daemon-reload")
-	}
-	if err := runServiceCommand("restart"); err != nil {
-		fmt.Println("Restart failed, rolling back...")
-		rollbackOK := true
-		if fileExists(backupBinary) {
-			if e := os.Rename(backupBinary, defaultBinaryPath); e != nil {
-				fmt.Printf("Warning: rollback binary failed: %v\n", e)
-				rollbackOK = false
-			}
-		}
-		if fileExists(backupCLI) {
-			if e := os.Rename(backupCLI, defaultCLIPath); e != nil {
-				fmt.Printf("Warning: rollback xbctl failed: %v\n", e)
-				rollbackOK = false
-			}
-		}
-		if detectInitSystem() == initSystemSystemd {
-			runCommand("systemctl", "daemon-reload")
-		}
-		if e := runServiceCommand("restart"); e != nil {
-			return fmt.Errorf("upgrade and rollback restart both failed: %w", e)
-		}
-		if rollbackOK {
-			return errors.New("upgrade failed: service restart failed, rolled back successfully")
-		}
-		return errors.New("upgrade failed: partial rollback, check binary state manually")
-	}
-
-	// Clean up backups
-	os.Remove(backupBinary)
-	os.Remove(backupCLI)
 
 	// Update install-meta.json
 	newVer := "unknown"
