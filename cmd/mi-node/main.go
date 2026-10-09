@@ -18,6 +18,7 @@ import (
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/machine"
 	"github.com/micah123321/mi-node/internal/nlog"
+	"github.com/micah123321/mi-node/internal/panel"
 	"github.com/micah123321/mi-node/internal/readiness"
 	"github.com/micah123321/mi-node/internal/service"
 	"github.com/micah123321/mi-node/internal/updateagent"
@@ -121,6 +122,9 @@ func main() {
 	}
 
 	config.InitLogger(instances[0].Log)
+	if err := panel.InitUpdateInventory(version, ""); err != nil {
+		nlog.Core().Warn("update inventory discovery disabled", "error", err)
+	}
 	applyRuntimeConfig(instances[0].Runtime)
 
 	runWithReload(rootCfg, *configPath)

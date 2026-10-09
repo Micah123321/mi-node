@@ -39,8 +39,9 @@ type Client struct {
 	configETag string
 	userETag   string
 
-	apiSuccess atomic.Uint64
-	apiFailure atomic.Uint64
+	discoveryOnce sync.Once
+	apiSuccess    atomic.Uint64
+	apiFailure    atomic.Uint64
 }
 
 // NewClient creates a new panel API client.
@@ -99,6 +100,16 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&hs); err != nil {
 		return nil, fmt.Errorf("decode handshake: %w", err)
 	}
+	if processInventory.Load() != nil {
+		c.discoveryOnce.Do(func() {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				// This independent report never consumes the traffic queue.
+				_ = c.postJSONContext(ctx, "/api/v2/server/report", map[string]interface{}{"update_inventory": *processInventory.Load()})
+			}()
+		})
+	}
 	return &hs, nil
 }
 
@@ -111,6 +122,9 @@ func (c *Client) Report(ctx context.Context, reportID string, traffic map[int][2
 	metrics map[string]interface{},
 ) error {
 	payload := make(map[string]interface{})
+	if inventory := processInventory.Load(); inventory != nil {
+		payload["update_inventory"] = *inventory
+	}
 	if reportID != "" {
 		payload["report_id"] = reportID
 	}
