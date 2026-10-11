@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -15,8 +16,12 @@ import (
 	"github.com/micah123321/mi-node/internal/panel"
 )
 
-func TestEmptyMachineStillUploadsAndRediscoveryUsesPanelDecision(t *testing.T) {
-	var discoveries, warmups, uploads, wireBytes atomic.Int32
+type machineDownloadTransport func(*http.Request) (*http.Response, error)
+
+func (f machineDownloadTransport) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestEmptyMachineStillDownloadsAndRediscoveryUsesPanelDecision(t *testing.T) {
+	var discoveries, downloads, uploads atomic.Int32
 	reports := make(chan bandwidthcheck.Report, 1)
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -29,27 +34,22 @@ func TestEmptyMachineStillUploadsAndRediscoveryUsesPanelDecision(t *testing.T) {
 			if r.URL.Query().Get("machine_id") != "7" || r.URL.Query().Get("node_id") != "0" || r.URL.Query().Get("token") != "fixture" {
 				t.Errorf("invalid machine scope")
 			}
-			json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.Config{Enabled: true, ProbeID: "lease", PolicyRevision: "v1", ThresholdMbps: 8, SampleSeconds: 8, ChunkBytes: 32768, MaxBytes: 65536, TimeoutSeconds: 2}})
+			json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.Config{Enabled: true,
+				State: bandwidthcheck.State{Suspended: true}, ProbeID: "lease", PolicyRevision: "cf-v1",
+				ProbeMethod: bandwidthcheck.CloudflareDownloadV1, DownloadURL: bandwidthcheck.CloudflareDownloadURL,
+				ThresholdMbps: 8, SampleSeconds: 8, ChunkBytes: 262144, MaxBytes: 10000000, TimeoutSeconds: 120}})
 		case "/api/v2/server/bandwidth/upload":
-			b, _ := io.ReadAll(r.Body)
-			wireBytes.Add(int32(len(b)))
-			if r.URL.Query().Get("warmup") == "1" {
-				warmups.Add(1)
-			} else {
-				uploads.Add(1)
-				// Slow acknowledgement must be included, even though Write completed.
-				time.Sleep(180 * time.Millisecond)
-			}
-			json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{"probe_id": "lease", "bytes_received": len(b)}})
+			uploads.Add(1)
+			t.Error("Cloudflare probe uploaded sample bytes to the panel")
+			http.Error(w, "unexpected upload", http.StatusBadRequest)
 		case "/api/v2/server/bandwidth/report":
 			var report bandwidthcheck.Report
 			if err := json.NewDecoder(r.Body).Decode(&report); err != nil {
 				t.Errorf("decode: %v", err)
 			}
 			reports <- report
-			// The backend fixture starts with two low samples; it owns the transition.
-			low := report.Error == nil && report.DurationMS > 0 && float64(report.BytesReceived)*8/(report.DurationMS*1000) < 8
-			json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.State{Suspended: low, NextCheckAt: 123}})
+			// Only the panel owns recovery and the resulting rediscovery transition.
+			json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.State{NextCheckAt: 123}})
 		default:
 			t.Errorf("unexpected path: %s", r.URL.Path)
 			http.NotFound(w, r)
@@ -60,6 +60,16 @@ func TestEmptyMachineStillUploadsAndRediscoveryUsesPanelDecision(t *testing.T) {
 	o := New(cfg)
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
+	ctx = bandwidthcheck.WithDownloadTransportForTesting(ctx, machineDownloadTransport(func(r *http.Request) (*http.Response, error) {
+		downloads.Add(1)
+		if r.Method != http.MethodGet || r.URL.String() != bandwidthcheck.CloudflareDownloadURL ||
+			r.Header.Get("Authorization") != "" || r.Header.Get("Cookie") != "" || len(r.URL.Query()) != 1 {
+			t.Errorf("download target or authentication isolation changed")
+		}
+		return &http.Response{StatusCode: http.StatusOK, ContentLength: 10000000,
+			Header: http.Header{"Content-Type": {"application/octet-stream"}},
+			Body:   io.NopCloser(strings.NewReader(strings.Repeat("x", 10000000)))}, nil
+	}))
 	done := make(chan error, 1)
 	go func() { done <- o.Run(ctx) }()
 	var result bandwidthcheck.Report
@@ -70,18 +80,22 @@ func TestEmptyMachineStillUploadsAndRediscoveryUsesPanelDecision(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("empty machine never ran bandwidth probe")
 	}
-	if result.Error != nil || result.BytesReceived != 32768 || result.DurationMS < 180 || result.ProbeID != "lease" || result.PolicyRevision != "v1" {
+	if result.Error != nil || result.BytesReceived != 10000000-262144 || result.DurationMS <= 0 ||
+		result.ProbeID != "lease" || result.PolicyRevision != "cf-v1" || result.ProbeMethod != bandwidthcheck.CloudflareDownloadV1 {
 		t.Fatalf("report: %+v", result)
 	}
-	if warmups.Load() != 1 || uploads.Load() != 1 || wireBytes.Load() != 65536 {
-		t.Fatalf("wire budget: warmups=%d uploads=%d bytes=%d", warmups.Load(), uploads.Load(), wireBytes.Load())
+	if mbps := float64(result.BytesReceived) * 8 / (result.DurationMS * 1000); mbps < 8 {
+		t.Fatalf("fast download was reported low: %.3f Mbps", mbps)
+	}
+	if downloads.Load() != 1 || uploads.Load() != 0 {
+		t.Fatalf("unexpected sample requests: downloads=%d uploads=%d", downloads.Load(), uploads.Load())
 	}
 	deadline := time.Now().Add(time.Second)
 	for discoveries.Load() < 3 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 	if discoveries.Load() < 3 {
-		t.Fatalf("authoritative transition did not trigger rediscovery: %d", discoveries.Load())
+		t.Fatalf("authoritative recovery did not trigger rediscovery: %d", discoveries.Load())
 	}
 	cancel()
 	select {

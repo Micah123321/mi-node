@@ -54,7 +54,7 @@ func TestBandwidthClientAuthenticationAndRawAcknowledgement(t *testing.T) {
 					if r.Method != "GET" {
 						t.Errorf("config method = %s", r.Method)
 					}
-					json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.Config{Enabled: true, State: bandwidthcheck.State{BlockService: true}, ProbeID: "lease"}})
+					json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.Config{Enabled: true, State: bandwidthcheck.State{BlockService: true}, ProbeID: "lease", ProbeMethod: bandwidthcheck.CloudflareDownloadV1, DownloadURL: bandwidthcheck.CloudflareDownloadURL}})
 				case "/api/v2/server/bandwidth/upload":
 					if r.Method != "POST" || r.Header.Get("Content-Type") != "application/octet-stream" || q.Get("probe_id") != "lease" || q.Get("warmup") != "1" {
 						t.Errorf("incorrect upload contract")
@@ -70,7 +70,7 @@ func TestBandwidthClientAuthenticationAndRawAcknowledgement(t *testing.T) {
 					if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 						t.Errorf("report decode: %v", err)
 					}
-					if len(raw) != 5 || raw["probe_id"] != "lease" || raw["policy_revision"] != "v1" || raw["error"] != nil {
+					if len(raw) != 6 || raw["probe_id"] != "lease" || raw["policy_revision"] != "v1" || raw["probe_method"] != bandwidthcheck.CloudflareDownloadV1 || raw["error"] != nil {
 						t.Errorf("report payload differs: %+v", raw)
 					}
 					json.NewEncoder(w).Encode(map[string]any{"data": bandwidthcheck.State{NextCheckAt: 123}})
@@ -92,7 +92,7 @@ func TestBandwidthClientAuthenticationAndRawAcknowledgement(t *testing.T) {
 				t.Fatal("bandwidth shares heartbeat transport")
 			}
 			policy, err := client.Config(context.Background())
-			if err != nil || !policy.BlockService {
+			if err != nil || !policy.BlockService || policy.ProbeMethod != bandwidthcheck.CloudflareDownloadV1 || policy.DownloadURL != bandwidthcheck.CloudflareDownloadURL {
 				t.Fatalf("policy=%+v error=%v", policy, err)
 			}
 			started := time.Now()
@@ -103,7 +103,7 @@ func TestBandwidthClientAuthenticationAndRawAcknowledgement(t *testing.T) {
 			if time.Since(started) < 30*time.Millisecond {
 				t.Fatal("upload returned before acknowledgement")
 			}
-			state, err := client.Report(context.Background(), bandwidthcheck.Report{ProbeID: "lease", PolicyRevision: "v1", BytesReceived: 100, DurationMS: 200})
+			state, err := client.Report(context.Background(), bandwidthcheck.Report{ProbeID: "lease", PolicyRevision: "v1", ProbeMethod: bandwidthcheck.CloudflareDownloadV1, BytesReceived: 100, DurationMS: 200})
 			if err != nil || state.NextCheckAt != 123 {
 				t.Fatalf("state=%+v error=%v", state, err)
 			}

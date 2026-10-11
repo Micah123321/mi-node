@@ -20,6 +20,8 @@ type Config struct {
 	RetryInterval    int     `json:"retry_interval"`
 	RecoveryInterval int     `json:"recovery_interval"`
 	ThresholdMbps    float64 `json:"threshold_mbps"`
+	ProbeMethod      string  `json:"probe_method"`
+	DownloadURL      string  `json:"download_url"`
 	SampleSeconds    int     `json:"sample_seconds"`
 	ChunkBytes       int     `json:"chunk_bytes"`
 	MaxBytes         int64   `json:"max_bytes"`
@@ -31,6 +33,7 @@ type Config struct {
 type Report struct {
 	ProbeID        string  `json:"probe_id"`
 	PolicyRevision string  `json:"policy_revision"`
+	ProbeMethod    string  `json:"probe_method"`
 	BytesReceived  int64   `json:"bytes_received"`
 	DurationMS     float64 `json:"duration_ms"`
 	Error          *string `json:"error"`

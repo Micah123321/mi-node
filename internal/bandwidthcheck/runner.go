@@ -12,7 +12,7 @@ import (
 	"github.com/micah123321/mi-node/internal/nlog"
 )
 
-// All runners in this process share one upload slot, including legacy nodes.
+// All runners in this process share one probe slot, including legacy nodes.
 // The panel's lease also coordinates separate processes for the same scope.
 var probeSlot = make(chan struct{}, 1)
 
@@ -112,9 +112,12 @@ func (r *Runner) Run(ctx context.Context) {
 }
 
 func (r *Runner) measure(ctx context.Context, cfg Config) Report {
-	report := Report{ProbeID: cfg.ProbeID, PolicyRevision: cfg.PolicyRevision}
+	report := Report{ProbeID: cfg.ProbeID, PolicyRevision: cfg.PolicyRevision, ProbeMethod: cfg.ProbeMethod}
 	fail := func(message string) Report { report.Error = &message; return report }
 	cfg = defaults(cfg)
+	if cfg.ProbeMethod != "" && cfg.ProbeMethod != CloudflareDownloadV1 {
+		return fail("unsupported bandwidth probe method")
+	}
 	if cfg.PolicyRevision == "" || math.IsNaN(cfg.ThresholdMbps) || math.IsInf(cfg.ThresholdMbps, 0) ||
 		cfg.ThresholdMbps <= 0 || cfg.ThresholdMbps > 100000 ||
 		cfg.ChunkBytes < 1 || cfg.ChunkBytes > 1024*1024 || cfg.MaxBytes <= int64(cfg.ChunkBytes) || cfg.MaxBytes > 64*1024*1024 ||
@@ -128,6 +131,9 @@ func (r *Runner) measure(ctx context.Context, cfg Config) Report {
 		defer func() { <-probeSlot }()
 	default:
 		return fail("another bandwidth probe is active")
+	}
+	if cfg.ProbeMethod == CloudflareDownloadV1 {
+		return measureDownload(probeCtx, cfg, report)
 	}
 	body := make([]byte, cfg.ChunkBytes)
 	if _, err := rand.Read(body); err != nil {
@@ -201,9 +207,15 @@ func defaults(cfg Config) Config {
 	}
 	if cfg.MaxBytes == 0 {
 		cfg.MaxBytes = 8388608
+		if cfg.ProbeMethod == CloudflareDownloadV1 {
+			cfg.MaxBytes = cloudflareDownloadBytes
+		}
 	}
 	if cfg.TimeoutSeconds == 0 {
 		cfg.TimeoutSeconds = 60
+		if cfg.ProbeMethod == CloudflareDownloadV1 {
+			cfg.TimeoutSeconds = 120
+		}
 	}
 	return cfg
 }
