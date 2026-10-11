@@ -20,6 +20,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/micah123321/mi-node/internal/bandwidthcheck"
 	"github.com/micah123321/mi-node/internal/cert"
 	"github.com/micah123321/mi-node/internal/cert/dnsproviders"
 	"github.com/micah123321/mi-node/internal/config"
@@ -84,6 +85,10 @@ type Service struct {
 	gfwCheckActive atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
+
+	// Only the main loop applies authoritative bandwidth states to the kernel.
+	bandwidthBlocked bool
+	bandwidthStates  chan bandwidthcheck.State
 
 	wsClient         controlplane.PushClient        // Push client (nil if push is not enabled)
 	wsEvents         chan controlplane.Event        // receives data events from push transport
@@ -181,18 +186,19 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	st := limiter.NewSpeedTracker(l)
 
 	return &Service{
-		cfg:          cfg,
-		source:       cp,
-		sink:         cp,
-		kernel:       k,
-		tracker:      tracker.New(),
-		trafficLimit: trafficlimit.New(filepath.Join(cfg.Kernel.ConfigDir, "traffic-limit-state.json"), time.Now),
-		limiter:      l,
-		speedTracker: st,
-		cert:         certMgr,
-		wsEvents:     make(chan controlplane.Event, 16),
-		wsStatusCh:   make(chan controlplane.StatusChange, 4),
-		pullResults:  make(chan pullResult, 1),
+		cfg:             cfg,
+		source:          cp,
+		sink:            cp,
+		kernel:          k,
+		tracker:         tracker.New(),
+		trafficLimit:    trafficlimit.New(filepath.Join(cfg.Kernel.ConfigDir, "traffic-limit-state.json"), time.Now),
+		limiter:         l,
+		speedTracker:    st,
+		cert:            certMgr,
+		wsEvents:        make(chan controlplane.Event, 16),
+		wsStatusCh:      make(chan controlplane.StatusChange, 4),
+		pullResults:     make(chan pullResult, 1),
+		bandwidthStates: make(chan bandwidthcheck.State, 1),
 	}
 }
 
@@ -200,6 +206,11 @@ func (s *Service) Run(ctx context.Context) error {
 	readyKey := readiness.Key(s.cfg.InstanceID, s.cfg.Panel.URL, s.cfg.Panel.NodeID)
 	readiness.Set(ctx, readyKey, false)
 	defer readiness.Set(ctx, readyKey, false)
+	stopBandwidth, err := s.startBandwidthRunner(ctx)
+	defer stopBandwidth()
+	if err != nil {
+		return err
+	}
 	if s.sink.SupportsReporting() {
 		if err := s.loadReportSpool(); err != nil {
 			return err
@@ -242,7 +253,7 @@ func (s *Service) Run(ctx context.Context) error {
 
 	for {
 		// A nil machine snapshot is not initialized, even when its WS loop is running.
-		initialized := s.lastConfig != nil && (s.kernel.IsRunning() || len(s.lastUsers) == 0 || (s.trafficLimit != nil && !s.trafficLimit.CanRun()))
+		initialized := s.lastConfig != nil && (s.kernel.IsRunning() || len(s.lastUsers) == 0 || s.runBlocked())
 		readiness.Set(ctx, readyKey, initialized)
 		select {
 		case <-ctx.Done():
@@ -268,6 +279,9 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 			nlog.Core().Debug("polling from API (ws not connected)")
 			s.pullViaAPIAsync(ctx)
+
+		case state := <-s.bandwidthStates:
+			s.applyBandwidthState(state)
 
 		case result := <-s.pullResults:
 			s.applyPullResult(ctx, result)
@@ -355,8 +369,8 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	}
 
 	s.applyRemoteOverrides(ctx, bootstrap.Config)
-	if s.trafficLimit != nil && !s.trafficLimit.CanRun() {
-		nlog.Core().Warn("kernel start skipped by node traffic limit")
+	if s.runBlocked() {
+		nlog.Core().Warn("kernel start skipped by node policy")
 		s.markMailboxReadyAndDrain(ctx)
 		return nil
 	}
@@ -991,8 +1005,8 @@ func (s *Service) restoreUserState(users []model.UserSpec, hash string) {
 // startKernel starts (or restarts) the kernel with the given config/users and
 // records the successfully applied state. Returns false on error.
 func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
-	if s.trafficLimit != nil && !s.trafficLimit.CanRun() {
-		nlog.Core().Warn("kernel start blocked by node traffic limit")
+	if s.runBlocked() {
+		nlog.Core().Warn("kernel start blocked by node policy", "bandwidth", s.bandwidthBlocked)
 		return false
 	}
 
@@ -1023,11 +1037,11 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 // ensureRunning starts the kernel if it is not running and there are users +
 // config available. Returns true if the kernel is running afterwards.
 func (s *Service) ensureRunning() bool {
+	if s.runBlocked() {
+		return false
+	}
 	if s.kernel.IsRunning() {
 		return true
-	}
-	if s.trafficLimit != nil && !s.trafficLimit.CanRun() {
-		return false
 	}
 	if len(s.lastUsers) > 0 && s.lastConfig != nil {
 		return s.startKernel(s.lastConfig, s.lastUsers)
@@ -1035,8 +1049,8 @@ func (s *Service) ensureRunning() bool {
 	return false
 }
 
-func (s *Service) trafficLimitBlocksRun() bool {
-	return s.trafficLimit != nil && !s.trafficLimit.CanRun()
+func (s *Service) runBlocked() bool {
+	return s.bandwidthBlocked || (s.trafficLimit != nil && !s.trafficLimit.CanRun())
 }
 
 // ─── User update entry points ───────────────────────────────────────────────
@@ -1044,7 +1058,7 @@ func (s *Service) trafficLimitBlocksRun() bool {
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if s.trafficLimitBlocksRun() {
+	if s.runBlocked() {
 		s.updateUserState(users)
 		if newHash != "" {
 			s.lastUserHash = newHash
@@ -1084,7 +1098,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if s.trafficLimitBlocksRun() {
+		if s.runBlocked() {
 			s.updateUserState(merged)
 			return
 		}
@@ -1123,7 +1137,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
 
-		if s.trafficLimitBlocksRun() {
+		if s.runBlocked() {
 			s.updateUserState(filtered)
 			return
 		}
@@ -1200,6 +1214,12 @@ func subtractUsers(base, delta []model.UserSpec) []model.UserSpec {
 // applyChanges applies config changes to the kernel. User-only changes are
 // handled by applyUserUpdate/applyUserDelta directly via the atomic user API.
 func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged bool) {
+	if s.runBlocked() {
+		if s.kernel.IsRunning() {
+			s.kernel.Stop()
+		}
+		return
+	}
 	if !configChanged {
 		return
 	}

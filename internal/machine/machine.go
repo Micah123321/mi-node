@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/micah123321/mi-node/internal/bandwidthcheck"
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/controlplane"
 	"github.com/micah123321/mi-node/internal/model"
@@ -79,6 +80,23 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	readyKey := readiness.Key(o.cfg.InstanceID, o.cfg.Panel.URL, 0)
 	readiness.Set(ctx, readyKey, false)
 	defer readiness.Set(ctx, readyKey, false)
+	bandwidthCtx, bandwidthCancel := context.WithCancel(ctx)
+	bandwidthClient := o.client.NewBandwidthClient()
+	bandwidthStates := make(chan bandwidthcheck.State, 1)
+	bandwidthRunner := bandwidthcheck.NewRunner(bandwidthClient, func(state bandwidthcheck.State) {
+		select {
+		case bandwidthStates <- state:
+		case <-bandwidthCtx.Done():
+		}
+	})
+	bandwidthDone := make(chan struct{})
+	go func() {
+		defer close(bandwidthDone)
+		defer bandwidthClient.Close()
+		bandwidthRunner.Run(bandwidthCtx)
+	}()
+	defer func() { bandwidthCancel(); <-bandwidthDone }()
+	var previousBandwidth *bandwidthcheck.State
 	nodesResp, err := o.client.GetMachineNodes()
 	if err != nil {
 		return fmt.Errorf("initial node discovery: %w", err)
@@ -107,6 +125,14 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return o.stopAll()
+
+		case state := <-bandwidthStates:
+			if previousBandwidth == nil || previousBandwidth.Suspended != state.Suspended || previousBandwidth.BlockService != state.BlockService {
+				// The panel filters only opted-in suspended nodes. Recovery is discovered
+				// even when the machine currently has no services at all.
+				o.rediscover(ctx)
+			}
+			previousBandwidth = &state
 
 		case <-discoveryTicker.C:
 			o.rediscover(ctx)
