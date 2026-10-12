@@ -85,12 +85,9 @@ func validHTTPS(raw string) error {
 	return nil
 }
 func NewClient(authority, token string) (*Client, error) {
-	if e := validHTTPS(authority); e != nil {
-		return nil, e
-	}
-	u, _ := url.Parse(authority)
-	if u.RawQuery != "" {
-		return nil, fmt.Errorf("authority query forbidden")
+	u, err := url.Parse(authority)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" || u.RawQuery != "" || u.ForceQuery {
+		return nil, fmt.Errorf("HTTP/HTTPS panel URL without credentials, query or fragment required")
 	}
 	return &Client{strings.TrimRight(authority, "/"), token, &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
 }

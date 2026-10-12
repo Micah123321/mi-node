@@ -8,6 +8,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/micah123321/mi-node/internal/discovery"
 )
 
 const bootstrapService = "mi-node-update-bootstrap.service"
@@ -27,21 +29,28 @@ WantedBy=timers.target
 
 // Bootstrap only asks systemd to start a separate service. Network enrollment,
 // layout inspection and transaction recovery belong to that service cgroup.
-func Bootstrap(ctx context.Context, configPath string) error {
+func Bootstrap(ctx context.Context, configPath string) (result error) {
+	status := newEnrollmentAttempt(StateDir, "bootstrap")
+	status.preserveTerminal = true
+	defer func() { status.finish(result) }()
 	reason, _, _ := Capability()
 	if os.Geteuid() != 0 || reason != "" {
+		status.state, status.code = "unsupported", "unsupported_platform"
 		return nil
 	}
 	executable, err := os.Executable()
 	if err != nil {
 		return err
 	}
+	status.stage = "layout"
 	if executable != BinaryPath {
+		status.state, status.code = "unsupported", "shared_binary_layout"
 		return nil
 	}
 	if err := checkBinaryLayout(); err != nil {
 		return err
 	}
+	status.done = true
 	return bootstrapUnits(ctx, "/etc/systemd/system", configPath, StateDir, Systemctl)
 }
 
@@ -108,7 +117,14 @@ func ensureUnits(ctx context.Context, directory string, units map[string]string,
 	return nil
 }
 
-func bootstrapUnits(ctx context.Context, directory, configPath, stateDirectory string, ctl systemctlFunc) error {
+func bootstrapUnits(ctx context.Context, directory, configPath, stateDirectory string, ctl systemctlFunc) (result error) {
+	status := newEnrollmentAttempt(stateDirectory, "config")
+	status.code, status.preserveTerminal = "config_invalid", true
+	defer func() {
+		if result != nil {
+			status.finish(result)
+		}
+	}()
 	environmentPath := filepath.Join(stateDirectory, "bootstrap", "environment.env")
 	service, err := bootstrapServiceUnit(configPath, environmentPath)
 	if err != nil {
@@ -117,13 +133,25 @@ func bootstrapUnits(ctx context.Context, directory, configPath, stateDirectory s
 	if err := writeBootstrapEnvironment(configPath, stateDirectory); err != nil {
 		return err
 	}
-	if err := ensureUnits(ctx, directory, map[string]string{bootstrapService: service, bootstrapTimer: bootstrapTimerUnit}, ctl); err != nil {
+	status.stage, status.code = "bootstrap", ""
+	trackedCtl := func(ctx context.Context, args ...string) (string, error) {
+		output, err := ctl(ctx, args...)
+		if err != nil {
+			status.code = "systemd_failed"
+		}
+		return output, err
+	}
+	if err := ensureUnits(ctx, directory, map[string]string{bootstrapService: service, bootstrapTimer: bootstrapTimerUnit}, trackedCtl); err != nil {
 		return err
 	}
-	if _, err := ctl(ctx, "enable", "--now", bootstrapTimer); err != nil {
+	// Publish before scheduling: the service may register before start returns.
+	if discovery.ReadEnrollmentStatus(stateDirectory) == nil {
+		status.write()
+	}
+	if _, err := trackedCtl(ctx, "enable", "--now", bootstrapTimer); err != nil {
 		return err
 	}
-	_, err = ctl(ctx, "start", "--no-block", bootstrapService)
+	_, err = trackedCtl(ctx, "start", "--no-block", bootstrapService)
 	return err
 }
 

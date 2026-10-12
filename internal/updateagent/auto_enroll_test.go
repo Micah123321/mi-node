@@ -31,7 +31,7 @@ func TestSelectAutoAuthority(t *testing.T) {
 	one := legacyBinding(a+"/", "server-fixture", 9, 2, 9)
 	two := legacyBinding(a, "server-fixture", 5, 2)
 	other := legacyBinding(b, "other-fixture", 4)
-	authority, auth, err := SelectAutoAuthority([]*config.Config{legacyBinding("http://old.example", "old", 1), one, other, two}, "")
+	authority, auth, err := SelectAutoAuthority([]*config.Config{legacyBinding("ftp://old.example", "old", 1), one, other, two}, "")
 	if err != nil || authority != a || auth["kind"] != "legacy" || !reflect.DeepEqual(auth["node_ids"], []int{2, 5, 9}) {
 		t.Fatalf("legacy scope: %s %v", authority, err)
 	}

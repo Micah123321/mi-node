@@ -23,10 +23,12 @@ func resetInventory(t *testing.T) {
 	t.Helper()
 	inventoryOnce = sync.Once{}
 	inventoryError = nil
+	inventoryDirectory = ""
 	processInventory.Store(nil)
 	t.Cleanup(func() {
 		inventoryOnce = sync.Once{}
 		inventoryError = nil
+		inventoryDirectory = ""
 		processInventory.Store(nil)
 	})
 }
@@ -57,7 +59,7 @@ func TestInventoryEveryBindingAndRetry(t *testing.T) {
 				}
 				bodies = append(bodies, body)
 				var got discovery.Inventory
-				if err := json.Unmarshal(body["update_inventory"], &got); err != nil || got != want || !got.AutoEnrollSupported {
+				if err := json.Unmarshal(body["update_inventory"], &got); err != nil || !reflect.DeepEqual(got, want) || !got.AutoEnrollSupported {
 					t.Errorf("inventory: %+v %v", got, err)
 				}
 				if string(body["token"]) != "\"original-token\"" || string(body["report_id"]) != "\"batch-unchanged\"" || string(body["traffic"]) != "{\"7\":[12,34]}" {
@@ -196,4 +198,95 @@ func TestHandshakeDiscoveryNonblockingOnce(t *testing.T) {
 	if reports.Load() != 1 {
 		t.Fatalf("startup report count: %d", reports.Load())
 	}
+}
+
+func TestInventoryEnrollmentStatusChangesWithoutReinit(t *testing.T) {
+	resetInventory(t)
+	const fixtureToken = "inventory-auth-fixture"
+	directory := t.TempDir()
+	path := filepath.Join(directory, discovery.EnrollmentStatusFile)
+	stale := discovery.EnrollmentStatus{State: "starting", Stage: "bootstrap", Code: "", UpdatedAt: "2026-10-12T08:09:10Z"}
+	writeStatus := func(status discovery.EnrollmentStatus) {
+		t.Helper()
+		data, err := json.Marshal(status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeStatus(stale)
+	if err := InitUpdateInventory("fixed-build", directory); err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan discovery.Inventory, 8)
+	server, client := newTestServer(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v2/server/handshake" {
+			_, _ = w.Write([]byte(`{"settings":[]}`))
+			return
+		}
+		var body struct {
+			Inventory discovery.Inventory `json:"update_inventory"`
+			Token     string              `json:"token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if body.Token != fixtureToken {
+			t.Error("inventory status changed auth token")
+		}
+		results <- body.Inventory
+		_, _ = w.Write([]byte(`{"data":true}`))
+	})
+	defer server.Close()
+	client.token = fixtureToken
+	receive := func(want *discovery.EnrollmentStatus) {
+		t.Helper()
+		select {
+		case inventory := <-results:
+			if !reflect.DeepEqual(inventory.EnrollmentStatus, want) || inventory.Version != "fixed-build" {
+				t.Fatalf("dynamic status: %+v want %+v", inventory, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("report missing")
+		}
+	}
+	report := func(want *discovery.EnrollmentStatus) {
+		t.Helper()
+		if err := client.Report(context.Background(), "same-batch", nil, nil, nil, 0, [2]uint64{}, [2]uint64{}, [2]uint64{}, nil); err != nil {
+			t.Fatal(err)
+		}
+		receive(want)
+	}
+	next := discovery.EnrollmentStatus{State: "retrying", Stage: "enroll", Code: "invalid_credentials", UpdatedAt: "2026-10-12T08:09:11Z"}
+	writeStatus(next)
+	// The handshake's asynchronous discovery report also reads the current file.
+	if _, err := client.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	receive(&next)
+	report(&next)
+	next.State, next.Stage, next.Code = "registered", "poll", ""
+	writeStatus(next)
+	report(&next)
+	if err := os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	report(nil)
+	writeStatus(next)
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(path, 0644); err != nil {
+			t.Fatal(err)
+		}
+		report(nil)
+		if err := os.Chmod(path, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report(&next)
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	report(nil)
 }

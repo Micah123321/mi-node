@@ -23,22 +23,28 @@ func SelectAutoAuthority(instances []*config.Config, authority string) (string, 
 	if authority != "" {
 		client, err := NewClient(authority, "")
 		if err != nil {
-			return "", nil, err
+			return "", nil, enrollmentError("authority_unavailable", err)
 		}
 		authority = client.Authority
 	} else {
-		for _, c := range instances {
-			if c == nil || c.Standalone != nil {
-				continue
+		// Preserve HTTPS preference while accepting existing HTTP-only installations.
+		for _, scheme := range []string{"https://", "http://"} {
+			for _, c := range instances {
+				if c == nil || c.Standalone != nil {
+					continue
+				}
+				if client, err := NewClient(c.Panel.URL, ""); err == nil && strings.HasPrefix(client.Authority, scheme) {
+					authority = client.Authority
+					break
+				}
 			}
-			if client, err := NewClient(c.Panel.URL, ""); err == nil {
-				authority = client.Authority
+			if authority != "" {
 				break
 			}
 		}
 	}
 	if authority == "" {
-		return "", nil, fmt.Errorf("no HTTPS authority binding")
+		return "", nil, enrollmentError("authority_unavailable", fmt.Errorf("no usable HTTP/HTTPS authority binding"))
 	}
 	auth := map[string]any{}
 	nodes := map[int]bool{}
@@ -55,7 +61,7 @@ func SelectAutoAuthority(instances []*config.Config, authority string) (string, 
 			kind, token, machineID = "machine", c.Machine.Token, c.Machine.MachineID
 		}
 		if token == "" {
-			return "", nil, fmt.Errorf("authority credential missing")
+			return "", nil, enrollmentError("credential_missing", fmt.Errorf("authority credential missing"))
 		}
 		if len(auth) == 0 {
 			auth["kind"], auth["token"] = kind, token
@@ -63,23 +69,23 @@ func SelectAutoAuthority(instances []*config.Config, authority string) (string, 
 				auth["machine_id"] = machineID
 			}
 		} else if auth["kind"] != kind || auth["token"] != token || (kind == "machine" && auth["machine_id"] != machineID) {
-			return "", nil, fmt.Errorf("authority bindings require incompatible credentials/scopes")
+			return "", nil, enrollmentError("scope_conflict", fmt.Errorf("authority bindings require incompatible credentials/scopes"))
 		}
 		if kind == "machine" {
 			if machineID <= 0 {
-				return "", nil, fmt.Errorf("invalid authority machine")
+				return "", nil, enrollmentError("validation_failed", fmt.Errorf("invalid authority machine"))
 			}
 			continue
 		}
 		for _, node := range c.ExpandNodes() {
 			if node.Panel.NodeID <= 0 {
-				return "", nil, fmt.Errorf("invalid authority node")
+				return "", nil, enrollmentError("validation_failed", fmt.Errorf("invalid authority node"))
 			}
 			nodes[node.Panel.NodeID] = true
 		}
 	}
 	if len(auth) == 0 {
-		return "", nil, fmt.Errorf("existing authority has no local binding")
+		return "", nil, enrollmentError("authority_unavailable", fmt.Errorf("existing authority has no local binding"))
 	}
 	if auth["kind"] == "legacy" {
 		ids := make([]int, 0, len(nodes))
@@ -118,12 +124,16 @@ type autoInstaller struct {
 	installUnits    func(context.Context) error
 	finishBootstrap func(context.Context) error
 	run             func(context.Context, Config) error
+	status          *enrollmentAttempt
 }
 
 // AutoInstall runs in the independent bootstrap service, never in mi-node.
 func AutoInstall(ctx context.Context, configPath string) error {
 	reason, init, container := Capability()
 	if os.Geteuid() != 0 || reason != "" {
+		status := newEnrollmentAttempt(StateDir, "bootstrap")
+		status.state, status.code, status.preserveTerminal = "unsupported", "unsupported_platform", true
+		status.finish(nil)
 		return fmt.Errorf("automatic enrollment unsupported")
 	}
 	installer := autoInstaller{
@@ -145,62 +155,88 @@ func AutoInstall(ctx context.Context, configPath string) error {
 	return installer.install(ctx, configPath)
 }
 
-func (i autoInstaller) install(ctx context.Context, configPath string) error {
+func (i autoInstaller) install(ctx context.Context, configPath string) (result error) {
+	status := newEnrollmentAttempt(i.directory, "layout")
+	status.preserveTerminal = true
+	i.status = status
+	defer func() { status.finish(result) }()
 	if err := i.checkLayout(ctx); err != nil {
 		return err
 	}
-	c, err := func() (Config, error) {
+	status.stage = "lock"
+	c, err := func() (c Config, result error) {
 		unlock, err := i.lock()
 		if err != nil {
-			return Config{}, err
+			return c, enrollmentError("update_busy", err)
 		}
 		defer unlock()
-		c, err := i.enroll(ctx, configPath)
+		// Publish under enrollment ownership, before another installer can acquire it.
+		defer func() { status.finish(result) }()
+		status.preserveTerminal = false
+		c, err = i.enroll(ctx, configPath)
 		if err != nil {
 			return c, err
 		}
+		status.stage = "units"
 		if !c.Disabled {
 			if err = i.installUnits(ctx); err != nil {
-				return c, err
+				return c, enrollmentError("systemd_failed", err)
 			}
 		}
-		return c, i.finishBootstrap(ctx)
+		if err = i.finishBootstrap(ctx); err != nil {
+			return c, enrollmentError("systemd_failed", err)
+		}
+		return c, nil
 	}()
 	if err != nil || c.Disabled {
 		return err
 	}
-	// Agent.Run takes the binary lock itself. Release enrollment ownership first.
+	// Agent.Run owns poll diagnostics; later task errors must not overwrite them.
 	return i.run(ctx, c)
 }
 
-func (i autoInstaller) enroll(ctx context.Context, configPath string) (Config, error) {
-	c, err := loadConfigAt(i.directory, i.identity)
+func (i autoInstaller) enroll(ctx context.Context, configPath string) (c Config, result error) {
+	status := i.status
+	if status == nil {
+		status = newEnrollmentAttempt(i.directory, "config")
+		defer func() { status.finish(result) }()
+	}
+	status.stage = "config"
+	var err error
+	c, err = loadConfigAt(i.directory, i.identity)
 	missing := errors.Is(err, os.ErrNotExist)
 	if err != nil && !missing {
-		return c, err
+		return c, enrollmentError("config_invalid", err)
 	}
 	if !missing {
-		if c.Disabled || c.Enrolled {
+		if c.Disabled {
+			status.state, status.code = "disabled", "local_disabled"
+			return c, nil
+		}
+		if c.Enrolled {
+			status.state = "registered"
 			return c, nil
 		}
 		if !c.AutoEnroll || c.EnrollmentID != "" {
-			return c, fmt.Errorf("pending manual enrollment retained")
+			return c, enrollmentError("config_invalid", fmt.Errorf("pending manual enrollment retained"))
 		}
 	}
 	root, err := i.loadRoot(configPath)
 	if err != nil {
-		return c, fmt.Errorf("read automatic enrollment bindings failed")
+		return c, enrollmentError("config_invalid", fmt.Errorf("read automatic enrollment bindings failed"))
 	}
 	instances, err := root.NormalizeInstances()
 	if err != nil {
-		return c, fmt.Errorf("normalize automatic enrollment bindings failed")
+		return c, enrollmentError("config_invalid", fmt.Errorf("normalize automatic enrollment bindings failed"))
 	}
+	status.stage = "authority"
 	authority, auth, err := SelectAutoAuthority(instances, c.Authority)
 	if err != nil {
 		return c, err
 	}
 	scope := autoScope(auth)
 	if missing {
+		status.stage = "config"
 		identity, err := i.identity()
 		if err != nil {
 			return c, err
@@ -224,11 +260,12 @@ func (i autoInstaller) enroll(ctx context.Context, configPath string) (Config, e
 			return c, err
 		}
 	} else if !sameScope(c.AutoScope, scope) {
-		return c, fmt.Errorf("pending automatic enrollment scope changed; identity retained")
+		return c, enrollmentError("scope_mismatch", fmt.Errorf("pending automatic enrollment scope changed; identity retained"))
 	}
+	status.stage = "authority"
 	client, err := i.client(c.Authority, "")
 	if err != nil {
-		return c, err
+		return c, enrollmentError("authority_unavailable", err)
 	}
 	var response struct {
 		InstallationID string          `json:"installation_id"`
@@ -236,6 +273,7 @@ func (i autoInstaller) enroll(ctx context.Context, configPath string) (Config, e
 		Revision       *int64          `json:"policy_revision"`
 	}
 	body := map[string]any{"protocol_version": 1, "installation_id": c.InstallationID, "agent_token": c.Token, "auth": auth}
+	status.stage = "enroll"
 	if err := client.Post(ctx, "/auto-enroll", body, &response); err != nil {
 		return c, err
 	}
@@ -244,5 +282,8 @@ func (i autoInstaller) enroll(ctx context.Context, configPath string) (Config, e
 	}
 	c.Scope, c.PolicyRevision, c.Enrolled = response.Scope, *response.Revision, true
 	err = AtomicJSON(filepath.Join(i.directory, "config.json"), c)
+	if err == nil {
+		status.state = "registered"
+	}
 	return c, err
 }

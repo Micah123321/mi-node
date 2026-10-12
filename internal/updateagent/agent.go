@@ -445,8 +445,10 @@ func (a *Agent) runAttempt(ctx context.Context, capability string, init string, 
 		After int `json:"poll_after_seconds"`
 	}
 	if err = a.Client.Post(ctx, "/poll", body, &poll); err != nil {
+		a.publishPollStatus(capability, err)
 		return err
 	}
+	a.publishPollStatus(capability, nil)
 	if poll.Candidate == nil || reason != nil {
 		return nil
 	}

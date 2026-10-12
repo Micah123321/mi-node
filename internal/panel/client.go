@@ -106,7 +106,9 @@ func (c *Client) Handshake() (*HandshakeResponse, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				defer cancel()
 				// This independent report never consumes the traffic queue.
-				_ = c.postJSONContext(ctx, "/api/v2/server/report", map[string]interface{}{"update_inventory": *processInventory.Load()})
+				if inventory := currentUpdateInventory(); inventory != nil {
+					_ = c.postJSONContext(ctx, "/api/v2/server/report", map[string]interface{}{"update_inventory": *inventory})
+				}
 			}()
 		})
 	}
@@ -122,7 +124,7 @@ func (c *Client) Report(ctx context.Context, reportID string, traffic map[int][2
 	metrics map[string]interface{},
 ) error {
 	payload := make(map[string]interface{})
-	if inventory := processInventory.Load(); inventory != nil {
+	if inventory := currentUpdateInventory(); inventory != nil {
 		payload["update_inventory"] = *inventory
 	}
 	if reportID != "" {

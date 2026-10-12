@@ -27,15 +27,17 @@ Mi Node 的专用节点后端，完整兼容 Mi API，支持 sing-box 与 Xray �
 
 ### 自动接入更新管理
 
-新版节点沿用现有配置及 machine/server token，业务启动后自动引导独立的 `mi-node-update-bootstrap.service` / timer，通过 HTTPS JSON `POST /api/v2/server/update/auto-enroll` 登记；无需登记票据或手工命令。自动登记默认关闭自动更新策略，登记成功后启用既有 `mi-node-update.timer` 并开始上报，是否更新由面板策略决定。
+新版节点沿用现有配置及 machine/server token，业务启动后自动引导独立的 `mi-node-update-bootstrap.service` / timer，沿用既有 HTTP/HTTPS 面板地址通过 JSON `POST /api/v2/server/update/auto-enroll` 登记；无需登记票据或手工命令。自动登记默认关闭自动更新策略，登记成功后启用既有 `mi-node-update.timer` 并开始上报，是否更新由面板策略决定。
 
-首次登记优先沿用 discovery 持久化安装 ID；ID、agent token 和待登记 scope 在 `/etc/mi-node/update-agent/config.json` 以 0600 保存，网络故障或 ACK 丢失由独立 timer 使用同一身份重试。凭据仅放入 HTTPS 请求体，服务命令只带实际 `-config` 路径；引导服务从现有 `/etc/mi-node/credentials.env` 及配置目录中的 `credentials.env` 加载环境变量，再使用 `config.LoadRoot` 解析配置。
+首次登记优先沿用 discovery 持久化安装 ID；ID、agent token 和待登记 scope 在 `/etc/mi-node/update-agent/config.json` 以 0600 保存，网络故障或 ACK 丢失由独立 timer 使用同一身份重试。认证信息只放在请求体或后续 agent Authorization 头中，服务命令只带实际 `-config` 路径；主进程仅将配置实际引用的环境变量保存为受限快照，独立引导服务加载该快照并使用 `config.LoadRoot` 解析同一配置。
 
-已有手工登记的身份、authority 和本地 disabled 状态保持原值；损坏或复制的配置会保留并报错，待完成的手工登记继续沿用原流程。多绑定优先沿用既有 authority，否则选择配置中首个有效 HTTPS 面板，旧节点 scope 汇集该面板全部节点并去重排序，要求 token 一致；同一面板的多个机器身份或混合机器/旧节点认证需先统一管理绑定。
+已有手工登记的身份、authority 和本地 disabled 状态保持原值；损坏或复制的配置会保留并报错，待完成的手工登记继续沿用原流程。多绑定优先沿用既有 authority，否则优先选择配置中有效 HTTPS 面板，没有 HTTPS 绑定时使用现有 HTTP 面板，旧节点 scope 汇集该面板全部节点并去重排序，要求 token 一致；同一面板的多个机器身份或混合机器/旧节点认证需先统一管理绑定。
 
 自动引导仅适用于 root、原生 Linux amd64/arm64、systemd 和 `/usr/local/bin/mi-node` / `/usr/local/bin/xbctl` 固定布局；非 root、容器和 OpenRC 保持现有业务运行。登记、布局检查和更新事务在独立服务中执行，后台失败不阻塞业务，版本探测 `version --json` / `-v` 不启动服务。发现上报中的 `auto_enroll_supported: true` 表示新版程序能力，与是否登记成功及更新策略开关无关。
 
 自动接入故障修复：EnvironmentFile 使用不带字面引号的绝对路径，兼容实际 systemd 解析；布局检查跳过无实例模板服务、检查实际实例并识别同服务别名，避免 `systemctl show getty@.service` 阻断登记。接入定时器会重试，故障日志保留具体 systemctl 子命令与退出状态。
+
+接入阶段与执行结果保存在 `/etc/mi-node/update-agent/enrollment-status.json`（0600），随既有业务上报动态发送；仅包含状态、阶段、固定错误码和UTC时间，无原始错误、配置或凭据。后台直接显示失败原因，普通周期 poll 成功会清除旧失败诊断；更新任务、锁和事件重放错误不会被误记成接入失败。修复后自动刷新为可用更新操作。HTTP绑定兼容需要同步发布后端接口，制品下载仍要求HTTPS且校验SHA256/大小/架构。
 
 ### 适用环境
 
