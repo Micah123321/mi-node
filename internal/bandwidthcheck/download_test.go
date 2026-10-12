@@ -304,7 +304,32 @@ func TestDownloadTransportIsolationAndRedirectRejection(t *testing.T) {
 	}
 }
 
+type downloadCauseBody struct{ *downloadBody }
+
+func (b *downloadCauseBody) Read(p []byte) (int, error) {
+	n, err := b.downloadBody.Read(p)
+	if errors.Is(err, context.Canceled) {
+		return n, context.Cause(b.ctx)
+	}
+	return n, err
+}
+
+func TestDownloadSampleCutoffAcceptsTransportCause(t *testing.T) {
+	body := &downloadCauseBody{&downloadBody{remaining: cloudflareDownloadBytes, bytesPerSecond: 512 * 1024}}
+	ctx := WithDownloadTransportForTesting(context.Background(), downloadRoundTripper(func(req *http.Request) (*http.Response, error) {
+		body.ctx = req.Context()
+		return downloadResponse(body), nil
+	}))
+	cfg := cloudflareConfig()
+	cfg.SampleSeconds, cfg.TimeoutSeconds = 1, 3
+	result := downloadRunner(t).measure(ctx, cfg)
+	if result.Error != nil || result.BytesReceived == 0 || !body.closed || !errors.Is(context.Cause(body.ctx), errSampleWindow) {
+		t.Fatalf("successful sample cutoff rejected its transport cause: %+v", result)
+	}
+}
+
 func TestDownloadHTTPBodySampleCutoffCancelsAndClosesStream(t *testing.T) {
+
 	serverDone := make(chan struct{})
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		defer close(serverDone)

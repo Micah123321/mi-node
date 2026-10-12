@@ -132,7 +132,8 @@ func measureDownload(ctx context.Context, cfg Config, report Report) Report {
 			if readErr == io.EOF && report.BytesReceived == remaining {
 				break
 			}
-			if errors.Is(context.Cause(requestCtx), errSampleWindow) && errors.Is(readErr, context.Canceled) {
+			if errors.Is(context.Cause(requestCtx), errSampleWindow) &&
+				(errors.Is(readErr, context.Canceled) || errors.Is(readErr, errSampleWindow)) {
 				return finishWindow()
 			}
 			return fail("download: incomplete body or read failure")

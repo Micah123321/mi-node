@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -97,10 +96,11 @@ func TestAgentRunPollStatusRecoversRegistered(t *testing.T) {
 				t.Fatal("poll failure swallowed")
 			}
 			requireEnrollmentStatus(t, a.Engine.Dir, "retrying", "poll", tc.code)
-			config, err := loadConfigAt(a.Engine.Dir, func() (string, error) { return "fixture-machine-identity", nil })
-			if err != nil || !reflect.DeepEqual(config, a.Config) || !config.Enrolled {
+			stored, err := os.ReadFile(filepath.Join(a.Engine.Dir, "config.json"))
+			if err != nil || !bytes.Equal(before, stored) || !a.Config.Enrolled {
 				t.Fatal("poll failure changed registered identity")
 			}
+			config := a.Config
 			fresh := contractAgent(t, a.Engine.Dir, server)
 			fresh.Config, fresh.Client.Token = config, config.Token
 			recovered.Store(true)
