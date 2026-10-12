@@ -23,7 +23,7 @@ Mi Node 的专用节点后端，完整兼容 Mi API，支持 sing-box 与 Xray �
 
 ## 推荐部署方式：本机直接部署
 
-如果你希望避免 Docker 带来的额外内存占用，推荐直接通过远程安装脚本进行原生部署。当前仓库远程地址为 `https://github.com/Micah123321/mi-node.git`，一键命令统一从 `dev` 分支的 Raw 脚本拉取并执行；推送到 `main`、`master` 或 `dev` 后，GitHub Actions 会在测试和四个 Linux 产物构建成功后创建新版本 Release，包含二进制与 `node-release.json`，完整上传后才设为 latest。`install.sh upgrade` 默认跟随最新 Release 的 `mi-node-linux-*` 和 `xbctl-linux-*` 产物。
+如果你希望避免 Docker 带来的额外内存占用，推荐直接通过远程安装脚本进行原生部署。当前仓库远程地址为 `https://github.com/Micah123321/mi-node.git`，一键命令统一从 `dev` 分支的 Raw 脚本拉取并执行；推送到 `main`、`master` 或 `dev` 后，GitHub Actions 会在测试和四个 Linux 产物构建成功后创建新版本 Release，包含二进制与 `node-release.json`，完整上传后才设为 latest。`install.sh upgrade` 默认跟随最新 Release 的 `mi-node-linux-*` 和 `xbctl-linux-*` 产物。新版 `xbctl upgrade --version dev` 与安装脚本 `--version dev` 兼容跟随 latest；CI 同步可变 dev 下载入口供旧 xbctl 使用，固定版本发行及清单 URL 保持不可变。
 
 ### 自动接入更新管理
 
@@ -34,6 +34,8 @@ Mi Node 的专用节点后端，完整兼容 Mi API，支持 sing-box 与 Xray �
 已有手工登记的身份、authority 和本地 disabled 状态保持原值；损坏或复制的配置会保留并报错，待完成的手工登记继续沿用原流程。多绑定优先沿用既有 authority，否则选择配置中首个有效 HTTPS 面板，旧节点 scope 汇集该面板全部节点并去重排序，要求 token 一致；同一面板的多个机器身份或混合机器/旧节点认证需先统一管理绑定。
 
 自动引导仅适用于 root、原生 Linux amd64/arm64、systemd 和 `/usr/local/bin/mi-node` / `/usr/local/bin/xbctl` 固定布局；非 root、容器和 OpenRC 保持现有业务运行。登记、布局检查和更新事务在独立服务中执行，后台失败不阻塞业务，版本探测 `version --json` / `-v` 不启动服务。发现上报中的 `auto_enroll_supported: true` 表示新版程序能力，与是否登记成功及更新策略开关无关。
+
+自动接入故障修复：EnvironmentFile 使用不带字面引号的绝对路径，兼容实际 systemd 解析；布局检查跳过无实例模板服务、检查实际实例并识别同服务别名，避免 `systemctl show getty@.service` 阻断登记。接入定时器会重试，故障日志保留具体 systemctl 子命令与退出状态。
 
 ### 适用环境
 

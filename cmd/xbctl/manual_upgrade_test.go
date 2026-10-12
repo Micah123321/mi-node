@@ -26,7 +26,7 @@ func manualFixture(t *testing.T) *updateagent.Engine {
 }
 
 func TestManualUpgradeTransaction(t *testing.T) {
-	for _, scenario := range []string{"latest", "version", "second-rename", "restart", "download", "validation", "unresolved", "rollback-failed", "corrupt", "busy"} {
+	for _, scenario := range []string{"latest", "dev", "version", "second-rename", "restart", "download", "validation", "unresolved", "rollback-failed", "corrupt", "busy"} {
 		t.Run(scenario, func(t *testing.T) {
 			e := manualFixture(t)
 			held, downloaded, released := false, 0, false
@@ -69,6 +69,9 @@ func TestManualUpgradeTransaction(t *testing.T) {
 			}
 			args := []string(nil)
 			versionPath := "/latest/download/"
+			if scenario == "dev" {
+				args = []string{"--version", "dev"}
+			}
 			if scenario == "version" {
 				args = []string{"--version", "v1.2.3"}
 				versionPath = "/download/v1.2.3/"
@@ -91,7 +94,7 @@ func TestManualUpgradeTransaction(t *testing.T) {
 				}
 				return nil
 			})
-			success := scenario == "latest" || scenario == "version"
+			success := scenario == "latest" || scenario == "dev" || scenario == "version"
 			if success != (err == nil) {
 				t.Fatalf("success=%v err=%v", success, err)
 			}

@@ -62,10 +62,12 @@ func bootstrapServiceUnit(configPath, environmentPath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	environment, err := unitPath(environmentPath)
-	if err != nil {
-		return "", err
+	environment, err := filepath.Abs(environmentPath)
+	if err != nil || strings.ContainsAny(environment, "\x00\r\n") {
+		return "", fmt.Errorf("invalid systemd environment path")
 	}
+	// EnvironmentFile consumes the whole absolute path; literal quotes become part of it.
+	environment = strings.ReplaceAll(environment, "%", "%%")
 	return fmt.Sprintf(`[Unit]
 Description=mi-node automatic update enrollment
 After=network-online.target

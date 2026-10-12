@@ -32,7 +32,8 @@ func Systemctl(ctx context.Context, args ...string) (string, error) {
 	defer cancel()
 	b, err := exec.CommandContext(bounded, "systemctl", args...).Output()
 	if err != nil {
-		return "", fmt.Errorf("systemctl failed")
+		// Report the fixed subcommand and exit status without printing ExecStart credentials.
+		return "", fmt.Errorf("systemctl %s failed: %w", strings.Join(args, " "), err)
 	}
 	return strings.TrimSpace(string(b)), nil
 }

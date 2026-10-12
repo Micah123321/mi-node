@@ -209,7 +209,32 @@ func TestWorkflowYAMLAndReleaseGates(t *testing.T) {
 	if concurrency["cancel-in-progress"] != false || concurrency["group"] != "mi-node-release" {
 		t.Fatal("publication must serialize latest updates across all versions")
 	}
-	if strings.Contains(string(data), "git tag -f dev") || strings.Contains(string(data), "--clobber") {
-		t.Fatal("immutable releases must never overwrite old assets/tags")
+	if strings.Contains(string(data), "git tag -f") || strings.Contains(string(data), "git push --force") {
+		t.Fatal("publication must preserve historical tags")
+	}
+	fixedIndex, devIndex := -1, -1
+	for i, entry := range release["steps"].([]any) {
+		step := entry.(map[string]any)
+		run, _ := step["run"].(string)
+		if step["id"] == "publish" {
+			fixedIndex = i
+		}
+		if step["name"] == "Sync mutable dev compatibility release" {
+			devIndex = i
+			if step["if"] != "${{ success() && steps.publish.outputs.promoted == 'true' }}" || run != `bash scripts/sync-dev-release.sh "$VERSION" "$GITHUB_SHA" dist` {
+				t.Fatal("dev sync must follow successful promotion with the fixed build identity")
+			}
+		} else if strings.Contains(run, "--clobber") {
+			t.Fatal("only the explicit dev sync may overwrite release assets")
+		}
+	}
+	if fixedIndex < 0 || devIndex <= fixedIndex {
+		t.Fatal("missing ordered fixed publication and dev sync steps")
+	}
+	for _, entry := range build["steps"].([]any) {
+		step := entry.(map[string]any)
+		if step["name"] == "Build" && step["env"].(map[string]any)["VERSION"] != "${{ needs.version.outputs.version }}" {
+			t.Fatal("compatibility binaries must embed the fixed VERSION")
+		}
 	}
 }

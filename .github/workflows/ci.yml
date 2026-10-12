@@ -169,6 +169,7 @@ jobs:
           go run ./scripts/release-manifest.go --version "$VERSION" \
             --repository "$GITHUB_REPOSITORY" --dir dist --output dist/node-release.json
       - name: Publish complete immutable release
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
@@ -190,10 +191,23 @@ jobs:
             dist/mi-node-linux-amd64 dist/mi-node-linux-arm64 \
             dist/xbctl-linux-amd64 dist/xbctl-linux-arm64 dist/node-release.json
           # An older, slower build must never move latest back from a newer release.
-          current_latest="$(gh release view --json tagName --jq .tagName 2>/dev/null || true)"
+          if ! current_latest="$(gh release view --json tagName --jq .tagName)"; then
+            # Confirm an empty release history before promoting the first release.
+            published_release="$(gh release list --limit 1 --exclude-drafts --exclude-pre-releases --json tagName --jq '.[0].tagName // empty')"
+            if [ -n "$published_release" ]; then
+              echo "Latest lookup failed despite existing published releases; promotion stopped." >&2
+              exit 1
+            fi
+            current_latest=""
+          fi
           promote=true
           if [[ "$current_latest" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
             newest="$(printf '%s\n%s\n' "$current_latest" "$VERSION" | sort -V | tail -n 1)"
             if [ "$newest" != "$VERSION" ]; then promote=false; fi
           fi
           gh release edit "$VERSION" --draft=false --latest="$promote"
+          echo "promoted=$promote" >> "$GITHUB_OUTPUT"
+      - name: Sync mutable dev compatibility release
+        if: ${{ success() && steps.publish.outputs.promoted == 'true' }}
+        shell: bash
+        run: bash scripts/sync-dev-release.sh "$VERSION" "$GITHUB_SHA" dist

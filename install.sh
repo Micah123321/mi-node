@@ -731,7 +731,7 @@ download_url() {
 
 release_url() {
     local asset="$1"
-    if [ -z "${RELEASE_VERSION}" ] || [ "${RELEASE_VERSION}" = "latest" ]; then
+    if [ -z "${RELEASE_VERSION}" ] || [ "${RELEASE_VERSION}" = "latest" ] || [ "${RELEASE_VERSION}" = "dev" ]; then
         printf '%s/latest/download/%s' "${RELEASES_BASE_URL}" "${asset}"
         return
     fi

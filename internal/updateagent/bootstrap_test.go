@@ -3,9 +3,12 @@ package updateagent
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestBootstrapIndependentRetryUnitsAndIdempotence(t *testing.T) {
@@ -56,6 +59,37 @@ func TestBootstrapIndependentRetryUnitsAndIdempotence(t *testing.T) {
 	after, _ := os.Stat(servicePath)
 	if !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) || strings.Contains(strings.Join(calls, " "), "daemon-reload") {
 		t.Fatal("unchanged bootstrap units rewritten")
+	}
+}
+
+func TestBootstrapEnvironmentPathNativeSystemdParser(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("native Linux parser required")
+	}
+	analyzer, err := exec.LookPath("systemd-analyze")
+	if err != nil {
+		t.Skip("systemd-analyze unavailable")
+	}
+	for _, directory := range []string{"plain", "space percent% dollar$"} {
+		t.Run(directory, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), directory, "environment.env")
+			unit, err := bootstrapServiceUnit("/etc/mi-node/config.yml", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Use an available executable for parser validation without running the bootstrap.
+			unit = strings.Replace(unit, "ExecStart=/usr/local/bin/xbctl update-agent auto-install -config \"/etc/mi-node/config.yml\"", "ExecStart=/bin/true", 1)
+			file := filepath.Join(t.TempDir(), "bootstrap-parser-check.service")
+			if err := os.WriteFile(file, []byte(unit), 0600); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			output, err := exec.CommandContext(ctx, analyzer, "verify", "--man=no", file).CombinedOutput()
+			if err != nil || strings.Contains(string(output), "EnvironmentFile= path is not absolute") {
+				t.Fatalf("systemd rejected generated bootstrap unit: %v: %s", err, output)
+			}
+		})
 	}
 }
 

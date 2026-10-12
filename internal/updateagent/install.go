@@ -84,11 +84,15 @@ func CheckLayout(ctx context.Context) error {
 	if strings.Contains(string(cgroup), "/mi-node.service") {
 		return fmt.Errorf("agent must run outside mi-node cgroup")
 	}
-	units, err := Systemctl(ctx, "list-unit-files", "--type=service", "--no-legend", "--no-pager")
+	return checkServiceLayout(ctx, Systemctl, filepath.EvalSymlinks)
+}
+
+func checkServiceLayout(ctx context.Context, ctl systemctlFunc, resolve func(string) (string, error)) error {
+	units, err := ctl(ctx, "list-unit-files", "--type=service", "--no-legend", "--no-pager")
 	if err != nil {
 		return err
 	}
-	loaded, err := Systemctl(ctx, "list-units", "--all", "--type=service", "--no-legend", "--no-pager", "--plain")
+	loaded, err := ctl(ctx, "list-units", "--all", "--type=service", "--no-legend", "--no-pager", "--plain")
 	if err != nil {
 		return err
 	}
@@ -102,14 +106,24 @@ func CheckLayout(ctx context.Context) error {
 		}
 		unit := fields[0]
 		seen[unit] = true
-		output, e := Systemctl(ctx, "show", unit, "--property=ExecStart")
+		// A template is not a runnable unit. Its actual instances are listed separately.
+		if strings.HasSuffix(unit, "@.service") {
+			continue
+		}
+		output, e := ctl(ctx, "show", unit, "--property=Id,ExecStart")
 		if e != nil {
 			return e
 		}
+		canonicalUnit := unit
+		for _, property := range strings.Split(output, "\n") {
+			if id, ok := strings.CutPrefix(property, "Id="); ok && id != "" {
+				canonicalUnit = id
+			}
+		}
 		for _, m := range pathRE.FindAllStringSubmatch(output, -1) {
-			p, e := filepath.EvalSymlinks(m[1])
+			p, e := resolve(m[1])
 			if e == nil && p == BinaryPath {
-				if unit != "mi-node.service" {
+				if canonicalUnit != "mi-node.service" {
 					return fmt.Errorf("shared_binary_layout")
 				}
 				found = true

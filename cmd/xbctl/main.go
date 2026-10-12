@@ -511,7 +511,8 @@ func ensureRoot(cmd string) error {
 }
 
 func resolveDownloadURL(artifact, version string) string {
-	if version == "latest" {
+	// The historical dev channel follows the latest fixed release.
+	if version == "latest" || version == "dev" {
 		return downloadBase + "/latest/download/" + artifact
 	}
 	return downloadBase + "/download/" + version + "/" + artifact
