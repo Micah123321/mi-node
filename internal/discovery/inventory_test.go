@@ -33,7 +33,7 @@ func TestPersistentConcurrentID(t *testing.T) {
 		if id == "" {
 			id = v.InstallationID
 		}
-		if v.InstallationID != id || v.Version != "dev" || v.OS != runtime.GOOS || v.Arch != runtime.GOARCH {
+		if v.InstallationID != id || v.Version != "dev" || v.OS != runtime.GOOS || v.Arch != runtime.GOARCH || !v.AutoEnrollSupported {
 			t.Fatalf("inconsistent inventory: %+v", v)
 		}
 	}

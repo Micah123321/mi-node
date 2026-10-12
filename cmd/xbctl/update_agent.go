@@ -11,14 +11,27 @@ import (
 	"github.com/micah123321/mi-node/internal/updateagent"
 )
 
+var autoInstallUpdateAgent = updateagent.AutoInstall
+
 func runUpdateAgent(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: xbctl update-agent install|run|status|disable")
+		return fmt.Errorf("usage: xbctl update-agent auto-install|install|run|status|disable")
 	}
 	if err := ensureRoot("update-agent"); err != nil {
 		return err
 	}
 	ctx := context.Background()
+	if args[0] == "auto-install" {
+		fs := flag.NewFlagSet("update-agent auto-install", flag.ContinueOnError)
+		path := fs.String("config", defaultConfigPath, "existing node config path")
+		if err := fs.Parse(args[1:]); err != nil {
+			return err
+		}
+		if fs.NArg() != 0 || strings.TrimSpace(*path) == "" {
+			return fmt.Errorf("auto-install requires a config path and no positional arguments")
+		}
+		return autoInstallUpdateAgent(ctx, *path)
+	}
 	if args[0] == "install" {
 		fs := flag.NewFlagSet("update-agent install", flag.ContinueOnError)
 		authority := fs.String("authority-panel-url", "", "HTTPS authority")

@@ -18,6 +18,8 @@ func InitUpdateInventory(version, directory string) error {
 		inventory, err := discovery.Load(directory, version)
 		inventoryError = err
 		if err == nil {
+			// Program capability is independent of enrollment and update policy.
+			inventory.AutoEnrollSupported = true
 			processInventory.Store(&inventory)
 		}
 	})

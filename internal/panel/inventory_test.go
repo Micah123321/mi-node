@@ -57,7 +57,7 @@ func TestInventoryEveryBindingAndRetry(t *testing.T) {
 				}
 				bodies = append(bodies, body)
 				var got discovery.Inventory
-				if err := json.Unmarshal(body["update_inventory"], &got); err != nil || got != want {
+				if err := json.Unmarshal(body["update_inventory"], &got); err != nil || got != want || !got.AutoEnrollSupported {
 					t.Errorf("inventory: %+v %v", got, err)
 				}
 				if string(body["token"]) != "\"original-token\"" || string(body["report_id"]) != "\"batch-unchanged\"" || string(body["traffic"]) != "{\"7\":[12,34]}" {

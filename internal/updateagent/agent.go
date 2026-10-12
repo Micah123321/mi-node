@@ -24,6 +24,9 @@ type Config struct {
 	Enrolled        bool            `json:"enrolled"`
 	Disabled        bool            `json:"disabled"`
 	MachineIdentity string          `json:"machine_identity"`
+	AutoEnroll      bool            `json:"auto_enroll,omitempty"`
+	AutoScope       json.RawMessage `json:"auto_enroll_scope,omitempty"`
+	PolicyRevision  int64           `json:"policy_revision,omitempty"`
 }
 type Enrollment struct {
 	ID         string `json:"enrollment_id"`
@@ -44,17 +47,27 @@ func ReadEnrollment(path string) (Enrollment, error) {
 }
 func machineIdentity() (string, error) { return Hash("/etc/machine-id") }
 func LoadConfig() (Config, error) {
+	return loadConfigAt(StateDir, machineIdentity)
+}
+
+func loadConfigAt(directory string, identityFn func() (string, error)) (Config, error) {
 	var c Config
-	if err := secureFile(filepath.Join(StateDir, "config.json")); err != nil {
+	if err := secureFile(filepath.Join(directory, "config.json")); err != nil {
 		return c, err
 	}
-	err := readJSON(filepath.Join(StateDir, "config.json"), &c)
+	err := readJSON(filepath.Join(directory, "config.json"), &c)
 	if err != nil {
 		return c, err
 	}
-	identity, err := machineIdentity()
+	identity, err := identityFn()
 	if err != nil || c.MachineIdentity != identity {
 		return c, fmt.Errorf("cloned installation: re-enrollment required")
+	}
+	token, tokenErr := base64.RawURLEncoding.DecodeString(c.Token)
+	_, authorityErr := NewClient(c.Authority, "")
+	if !uuidRE.MatchString(c.InstallationID) || tokenErr != nil || len(token) != 32 || len(c.Token) != 43 || authorityErr != nil ||
+		(c.Enrolled && (len(c.Scope) == 0 || string(c.Scope) == "null")) {
+		return c, fmt.Errorf("invalid update agent config; identity retained")
 	}
 	return c, nil
 }

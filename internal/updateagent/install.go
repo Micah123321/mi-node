@@ -52,13 +52,17 @@ func Capability() (reason, init string, container bool) {
 			}
 		}
 	}
+	return platformCapability(runtime.GOOS, runtime.GOARCH, init, container)
+}
+
+func platformCapability(goos, arch, init string, container bool) (string, string, bool) {
 	if container {
 		return "docker", init, true
 	}
-	if runtime.GOOS != "linux" {
+	if goos != "linux" {
 		return "unsupported_os", init, false
 	}
-	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+	if arch != "amd64" && arch != "arm64" {
 		return "unsupported_arch", init, false
 	}
 	if init == "openrc" {
@@ -70,15 +74,8 @@ func Capability() (reason, init string, container bool) {
 	return "", init, false
 }
 func CheckLayout(ctx context.Context) error {
-	for _, p := range []string{BinaryPath, CLIPath} {
-		real, e := filepath.EvalSymlinks(p)
-		if e != nil || real != p {
-			return fmt.Errorf("shared_binary_layout")
-		}
-		s, e := os.Stat(p)
-		if e != nil || !s.Mode().IsRegular() {
-			return fmt.Errorf("shared_binary_layout")
-		}
+	if err := checkBinaryLayout(); err != nil {
+		return err
 	}
 	cgroup, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
@@ -125,13 +122,7 @@ func CheckLayout(ctx context.Context) error {
 	return nil
 }
 func InstallUnits(ctx context.Context) error {
-	if err := atomicBytes("/etc/systemd/system/mi-node-update.service", []byte(ServiceUnit), 0644); err != nil {
-		return err
-	}
-	if err := atomicBytes("/etc/systemd/system/mi-node-update.timer", []byte(TimerUnit), 0644); err != nil {
-		return err
-	}
-	if _, err := Systemctl(ctx, "daemon-reload"); err != nil {
+	if err := ensureUnits(ctx, "/etc/systemd/system", map[string]string{"mi-node-update.service": ServiceUnit, "mi-node-update.timer": TimerUnit}, Systemctl); err != nil {
 		return err
 	}
 	_, err := Systemctl(ctx, "enable", "--now", "mi-node-update.timer")

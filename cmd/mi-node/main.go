@@ -102,7 +102,7 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("mi-node %s (built %s)\n", version, buildTime)
-		os.Exit(0)
+		return
 	}
 
 	rootCfg, err := config.LoadRoot(*configPath)
@@ -126,8 +126,21 @@ func main() {
 		nlog.Core().Warn("update inventory discovery disabled", "error", err)
 	}
 	applyRuntimeConfig(instances[0].Runtime)
+	startUpdateBootstrap(*configPath)
 
 	runWithReload(rootCfg, *configPath)
+}
+
+var bootstrapUpdateAgent = updateagent.Bootstrap
+
+func startUpdateBootstrap(configPath string) {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := bootstrapUpdateAgent(ctx, configPath); err != nil {
+			nlog.Core().Warn("automatic update bootstrap deferred", "error", err)
+		}
+	}()
 }
 
 func runWithReload(initialRoot *config.RootConfig, configPath string) {

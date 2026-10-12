@@ -15,10 +15,11 @@ import (
 const DefaultDirectory = "/etc/mi-node/update-agent"
 
 type Inventory struct {
-	InstallationID string `json:"installation_id"`
-	Version        string `json:"version"`
-	OS             string `json:"os"`
-	Arch           string `json:"arch"`
+	InstallationID      string `json:"installation_id"`
+	Version             string `json:"version"`
+	OS                  string `json:"os"`
+	Arch                string `json:"arch"`
+	AutoEnrollSupported bool   `json:"auto_enroll_supported"`
 }
 
 func Load(directory, version string) (Inventory, error) {
@@ -29,7 +30,7 @@ func Load(directory, version string) (Inventory, error) {
 	if err != nil {
 		return Inventory{}, err
 	}
-	return Inventory{id, version, runtime.GOOS, runtime.GOARCH}, nil
+	return Inventory{InstallationID: id, Version: version, OS: runtime.GOOS, Arch: runtime.GOARCH, AutoEnrollSupported: true}, nil
 }
 
 func installationID(directory string) (string, error) {

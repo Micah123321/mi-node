@@ -27,6 +27,7 @@ jobs:
       - name: Run tests
         run: |
           go test ./scripts
+          go test ./cmd/xbctl ./cmd/mi-node
           make test
 
   version:
