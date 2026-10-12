@@ -434,10 +434,14 @@ func (a *Agent) runAttempt(ctx context.Context, capability string, init string, 
 	if err = a.Client.Post(ctx, "/poll", body, &poll); err != nil {
 		return err
 	}
-	if poll.Candidate == nil || !poll.Global || !poll.Policy.Enabled || reason != nil {
+	if poll.Candidate == nil || reason != nil {
 		return nil
 	}
-	if !uuidRE.MatchString(poll.Candidate.TaskID) || poll.Candidate.Revision != poll.Policy.Revision {
+	// Panel manual tasks bypass automatic policy switches, never local capability gates.
+	if !poll.Candidate.Manual && (!poll.Global || !poll.Policy.Enabled) {
+		return nil
+	}
+	if !uuidRE.MatchString(poll.Candidate.TaskID) || poll.Candidate.Revision < 1 || (!poll.Candidate.Manual && poll.Candidate.Revision != poll.Policy.Revision) {
 		return fmt.Errorf("invalid candidate")
 	}
 	t = &Transaction{TaskID: poll.Candidate.TaskID, ClaimID: UUID(), Candidate: *poll.Candidate, CredentialRef: "config.json", Phase: "claiming"}

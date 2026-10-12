@@ -23,7 +23,7 @@ Mi Node 的专用节点后端，完整兼容 Mi API，支持 sing-box 与 Xray �
 
 ## 推荐部署方式：本机直接部署
 
-如果你希望避免 Docker 带来的额外内存占用，推荐直接通过远程安装脚本进行原生部署。当前仓库远程地址为 `https://github.com/Micah123321/mi-node.git`，一键命令统一从 `dev` 分支的 Raw 脚本拉取并执行；推送到当前仓库 `dev` 分支后，GitHub Actions 会自动更新当前仓库的 Release，`install.sh upgrade` 会默认跟随这里的最新 `mi-node-linux-*` 和 `xbctl-linux-*` 产物。
+如果你希望避免 Docker 带来的额外内存占用，推荐直接通过远程安装脚本进行原生部署。当前仓库远程地址为 `https://github.com/Micah123321/mi-node.git`，一键命令统一从 `dev` 分支的 Raw 脚本拉取并执行；推送到 `main`、`master` 或 `dev` 后，GitHub Actions 会在测试和四个 Linux 产物构建成功后创建新版本 Release，包含二进制与 `node-release.json`，完整上传后才设为 latest。`install.sh upgrade` 默认跟随最新 Release 的 `mi-node-linux-*` 和 `xbctl-linux-*` 产物。
 
 ### 适用环境
 
@@ -276,6 +276,35 @@ make build-linux-arm64
 ```
 
 `make build-linux` 与 `make build-linux-arm64` 会同时生成 `mi-node-linux-*` 和 `xbctl-linux-*`，Release 会发布这两类产物。
+
+### 固定版本与发布清单
+
+CI 对非 tag 构建一次生成 `v<UTC YYYYMMDD>.<GITHUB_RUN_ID>.<GITHUB_RUN_ATTEMPT>`，所有四个二进制与清单复用同一版本。tag 仅接受严格的 `v数字.数字.数字`，每段除 `0` 外均无前导零，不接受预发布后缀或构建元数据；无效 tag 会在 Linux 二进制构建与 Release 发布前失败。`dev` 标签不再移动。
+
+Release 按版本串行发布，已有 Release（包括未完成草稿）会使同版本重跑失败，既有产物不会被覆盖。非 tag 工作流整体重跑使用新的 attempt 版本；仅重跑失败作业会沿用已解析的版本。CI 构建工件按版本隔离，可由重跑替换；Release 上传先进入草稿，四个二进制与清单全部上传成功后才公开并更新 latest，避免暴露缺清单的发布。Docker 的触发条件和镜像标签规则保持原样。
+
+本地构建和准备上传时也可使用独立脚本，需安装与 `go.mod` 匹配的 Go：
+
+```bash
+VERSION="$(go run ./scripts/release-manifest.go --version-only)"
+# 也可明确指定 VERSION=v1.2.3；务必只解析一次，供全部构建复用。
+make build-all VERSION="$VERSION"
+go run ./scripts/release-manifest.go --version "$VERSION" \
+  --repository Micah123321/mi-node --dir . --output node-release.json
+```
+
+无 GitHub Actions 运行标识时，自动版本使用 `v<UTC YYYYMMDD>.<Unix纳秒>.0`。脚本读取四个非空 Linux 文件，生成纯 JSON 对象，顶层仅含 `version`、`os`、`min_agent_protocol`、`artifacts`；每个 artifact 仅含 `arch`、`component`、`https_url`、`sha256`、`size_bytes`。SHA256 与字节数来自真实文件，缺产物会失败；URL 固定为 `https://github.com/<OWNER>/<REPO>/releases/download/<version>/<filename>`，最小 Agent 协议为 `1`。`--output -` 可将 JSON 输出到标准输出。
+
+如手动上传，先创建同版本草稿，上传全部五个文件，再公开；不要复用已有 Release 或使用覆盖参数：
+
+```bash
+gh release create "$VERSION" --draft --target "$(git rev-parse HEAD)" --title "$VERSION" --generate-notes
+gh release upload "$VERSION" mi-node-linux-amd64 mi-node-linux-arm64 \
+  xbctl-linux-amd64 xbctl-linux-arm64 node-release.json
+gh release edit "$VERSION" --draft=false --latest
+```
+
+新版 poll 候选支持 `manual: true`：管理员手动升级可在面板全局或策略自动开关关闭时领取，仍受本地 `Config.Disabled`、能力、策略修订、租约、产物验证与事务恢复约束，并保持正常面板事件上报。
 
 ### 运行测试
 

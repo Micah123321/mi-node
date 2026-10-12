@@ -44,6 +44,7 @@ type Candidate struct {
 	ReleaseID string `json:"release_id"`
 	Version   string `json:"version"`
 	Revision  int64  `json:"policy_revision"`
+	Manual    bool   `json:"manual"`
 }
 type Claim struct {
 	TaskID       string    `json:"task_id"`
