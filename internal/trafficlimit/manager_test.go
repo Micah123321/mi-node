@@ -154,3 +154,74 @@ func TestManagerLimitIncreaseResumesSuspendedNode(t *testing.T) {
 		t.Fatalf("Snapshot().Status = %q, want %q", snapshot.Status, StatusNormal)
 	}
 }
+
+func TestManagerReconcilesSameCycleUsage(t *testing.T) {
+	now := time.Date(2026, 4, 28, 12, 0, 0, 0, time.UTC)
+	manager := New("", func() time.Time { return now })
+	cfg := Config{Enabled: true, Limit: 100, CurrentUsed: 10, LastResetAt: now.Add(-time.Hour).Unix(),
+		NextResetAt: now.Add(time.Hour).Unix(), Timezone: "UTC"}
+	if _, err := manager.Configure(cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.CurrentUsed = 100
+	if action, err := manager.Configure(cfg); err != nil || action != ActionSuspend {
+		t.Fatalf("same-cycle reconciliation: action=%v error=%v", action, err)
+	}
+	cfg.CurrentUsed = 10
+	if action, err := manager.Configure(cfg); err != nil || action != ActionNone || manager.CanRun() {
+		t.Fatal("a smaller report must not erase same-cycle usage or resume an exhausted quota")
+	}
+	cfg.LastResetAt = now.Unix()
+	cfg.CurrentUsed = 0
+	if action, err := manager.Configure(cfg); err != nil || action != ActionResume {
+		t.Fatalf("explicit reset: action=%v error=%v", action, err)
+	}
+	cfg.LastResetAt--
+	cfg.CurrentUsed = 100
+	if action, err := manager.Configure(cfg); err != nil || action != ActionNone || manager.Snapshot().Used != 0 {
+		t.Fatal("an old-cycle report must not refill a reset quota")
+	}
+}
+
+func TestManagerDelayedScheduledResetReconcilesPanelCycle(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		day                    int
+		due, checked, boundary time.Time
+	}{
+		{"late-check", 1, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 5, 1, 0, 0, 5, 0, time.UTC), time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC)},
+		{"missed-cycles", 1, time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC), time.Date(2026, 7, 13, 0, 0, 5, 0, time.UTC), time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)},
+		{"short-month", 31, time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC), time.Date(2026, 2, 28, 0, 0, 5, 0, time.UTC), time.Date(2026, 2, 28, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := tc.due.Add(-time.Hour)
+			path := filepath.Join(t.TempDir(), "quota.json")
+			manager := New(path, func() time.Time { return now })
+			cfg := Config{Enabled: true, Limit: 100, CurrentUsed: 100, ResetDay: tc.day, ResetTime: "00:00", Timezone: "UTC",
+				LastResetAt: tc.due.Add(-24 * time.Hour).Unix(), NextResetAt: tc.due.Unix()}
+			if action, err := manager.Configure(cfg); err != nil || action != ActionSuspend {
+				t.Fatalf("initial quota: action=%v error=%v", action, err)
+			}
+			now = tc.checked
+			if action, err := manager.CheckReset(); err != nil || action != ActionResume {
+				t.Fatalf("scheduled reset: action=%v error=%v", action, err)
+			}
+			if got := manager.Snapshot().LastResetAt; got != tc.boundary.Unix() {
+				t.Fatalf("reset time must identify the scheduled cycle: got=%d want=%d", got, tc.boundary.Unix())
+			}
+			if action, err := manager.AddTraffic(5, 0); err != nil || action != ActionNone {
+				t.Fatalf("new-cycle local usage: action=%v error=%v", action, err)
+			}
+			restored := New(path, func() time.Time { return now })
+			cfg.CurrentUsed = 200
+			if action, err := restored.Configure(cfg); err != nil || action != ActionNone || restored.Snapshot().Used != 5 {
+				t.Fatal("an old-cycle report refilled or cleared the persisted reset quota")
+			}
+			cfg.NextResetAt = manager.Snapshot().NextResetAt
+			cfg.LastResetAt, cfg.CurrentUsed = tc.boundary.Unix(), cfg.Limit
+			if action, err := restored.Configure(cfg); err != nil || action != ActionSuspend || restored.CanRun() {
+				t.Fatalf("same-cycle panel exhaustion ignored after a delayed reset: action=%v error=%v", action, err)
+			}
+		})
+	}
+}

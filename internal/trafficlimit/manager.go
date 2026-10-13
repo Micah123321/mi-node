@@ -92,12 +92,13 @@ func (m *Manager) Configure(cfg Config) (Action, error) {
 		m.state.LastResetAt = m.cfg.LastResetAt
 		m.state.Suspended = false
 		m.state.SuspendedAt = 0
-	} else if m.state.Used == 0 && m.cfg.CurrentUsed > 0 {
+	} else if m.cfg.LastResetAt == m.state.LastResetAt && m.cfg.CurrentUsed > m.state.Used {
+		// Reconcile same-cycle usage monotonically; older cycles must not refill a reset quota.
 		m.state.Used = m.cfg.CurrentUsed
 	}
 
 	m.state.Timezone = m.cfg.Timezone
-	if m.cfg.NextResetAt > 0 {
+	if m.cfg.NextResetAt > m.state.LastResetAt {
 		m.state.NextResetAt = m.cfg.NextResetAt
 	} else {
 		m.refreshNextResetLocked(now)
@@ -202,7 +203,12 @@ func (m *Manager) resetLocked(now time.Time) {
 	m.state.Used = 0
 	m.state.Suspended = false
 	m.state.SuspendedAt = 0
-	m.state.LastResetAt = now.Unix()
+	// Use the cycle boundary, rather than the later timer tick, as reset identity.
+	boundary := scheduledResetAtOrBefore(now, m.cfg).Unix()
+	if m.state.NextResetAt > boundary && m.state.NextResetAt <= now.Unix() {
+		boundary = m.state.NextResetAt
+	}
+	m.state.LastResetAt = boundary
 	m.state.Timezone = m.cfg.Timezone
 	m.state.NextResetAt = nextResetAfter(now, m.cfg).Unix()
 }
@@ -274,7 +280,23 @@ func nextResetAfter(from time.Time, cfg Config) time.Time {
 	return targetForMonth(next.Year(), next.Month(), cfg.ResetDay, hour, minute, loc)
 }
 
+func scheduledResetAtOrBefore(now time.Time, cfg Config) time.Time {
+	loc, err := time.LoadLocation(cfg.Timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	local := now.In(loc)
+	hour, minute := parseResetTime(cfg.ResetTime)
+	target := targetForMonth(local.Year(), local.Month(), cfg.ResetDay, hour, minute, loc)
+	if target.After(local) {
+		previous := time.Date(local.Year(), local.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, -1, 0)
+		return targetForMonth(previous.Year(), previous.Month(), cfg.ResetDay, hour, minute, loc)
+	}
+	return target
+}
+
 func targetForMonth(year int, month time.Month, day, hour, minute int, loc *time.Location) time.Time {
+
 	first := time.Date(year, month, 1, hour, minute, 0, 0, loc)
 	lastDay := first.AddDate(0, 1, -1).Day()
 	return time.Date(year, month, clamp(day, 1, lastDay), hour, minute, 0, 0, loc)

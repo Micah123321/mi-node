@@ -3,6 +3,7 @@ package controlplane
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/micah123321/mi-node/internal/config"
@@ -17,6 +18,7 @@ type PanelControlPlane struct {
 	wsCfg  config.WSConfig
 	kcfg   config.KernelConfig
 	client *panel.Client
+	resync atomic.Bool
 }
 
 type panelPushClient struct {
@@ -69,7 +71,20 @@ func (p *PanelControlPlane) Initial(ctx context.Context, metricsFn func() map[st
 	return bootstrap, nil
 }
 
+// RequestResync forces the next serialized poll to fetch a full authoritative snapshot.
+func (p *PanelControlPlane) RequestResync() { p.resync.Store(true) }
+
 func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
+	complete := false
+	defer func() {
+		if !complete {
+			p.resync.Store(true)
+		}
+	}()
+	if p.resync.Swap(false) {
+		p.client.ResetConfigETag()
+		p.client.ResetUserETag()
+	}
 	configSnapshot, err := p.client.GetConfig()
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config: %w", err)
@@ -87,6 +102,7 @@ func (p *PanelControlPlane) Poll(ctx context.Context) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("poll config normalize: %w", err)
 	}
+	complete = true
 	return Snapshot{Config: nodeSpec, Users: model.UserSpecsFromPanel(users)}, nil
 }
 

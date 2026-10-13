@@ -9,7 +9,7 @@ import (
 
 	"github.com/micah123321/mi-node/internal/cert"
 	"github.com/micah123321/mi-node/internal/config"
-	"github.com/micah123321/mi-node/internal/panel"
+	"github.com/micah123321/mi-node/internal/model"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/service"
 )
@@ -42,7 +42,7 @@ func TestSingBoxStart_TUICWithShadowsocksEgress_UsesDefaultShadowsocks(t *testin
 	kcfg.Egress.Shadowsocks.Method = "aes-128-gcm"
 	kcfg.Egress.Shadowsocks.Password = "test-password"
 
-	nc := &panel.NodeConfig{
+	nc := &model.NodeSpec{
 		Protocol:          "tuic",
 		ServerPort:        port,
 		ServerName:        "node.example.com",
@@ -50,7 +50,7 @@ func TestSingBoxStart_TUICWithShadowsocksEgress_UsesDefaultShadowsocks(t *testin
 	}
 
 	sb := New(kcfg)
-	if err := sb.Start(nc, testUsers[:1], certManager.CertFile(), certManager.KeyFile()); err != nil {
+	if err := sb.Start(nc, testUsers[:1], certManager.TLSCert()); err != nil {
 		t.Fatalf("start sing-box: %v", err)
 	}
 	defer sb.Stop()

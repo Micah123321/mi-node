@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -69,7 +68,7 @@ type Service struct {
 	pullInterval int // seconds
 
 	lastUserHash   string     // hash of user list for change detection
-	lastConfigHash string     // hash of full config for change detection
+	lastConfigHash string     // hash of protocol settings for change detection
 	pullBackoff    apiBackoff // backoff for panel pull failures
 	pushBackoff    apiBackoff // backoff for panel push failures
 
@@ -96,6 +95,7 @@ type Service struct {
 	wsCancel         context.CancelFunc             // cancels the WS client goroutine
 	wsDisconnectAt   time.Time                      // when WS last disconnected (zero if connected)
 	wsResyncPending  atomic.Bool
+	wsResyncRevision uint64 // Main-loop generation of authoritative reconciliation requests.
 	machineMailbox   *controlplane.NodeMailbox
 	machineMailboxCh <-chan struct{}
 
@@ -108,11 +108,14 @@ type Service struct {
 
 // pullResult carries the outcome of an async pullViaAPI back to the main goroutine.
 type pullResult struct {
-	config      *model.NodeSpec
-	users       []model.UserSpec
-	configHash  string
-	userHash    string
-	certChanged bool
+	config         *model.NodeSpec
+	users          []model.UserSpec
+	configHash     string
+	userHash       string
+	baseConfig     *model.NodeSpec
+	baseUserHash   string
+	stateCaptured  bool
+	resyncRevision uint64
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -262,6 +265,9 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-trackTicker.C:
 			s.trackAndEnforce(ctx)
 
+		case <-s.cert.RenewalEvents():
+			s.applyCertificateRenewal(ctx, s.cert.CertRenewed())
+
 		case <-reportTicker.C:
 			s.pushReportAsync()
 
@@ -272,9 +278,8 @@ func (s *Service) Run(ctx context.Context) error {
 			s.pullGFWCheckTask(ctx)
 
 		case <-pullTicker.C:
-			// When WebSocket is connected, skip REST polling entirely.
-			// Config/user updates arrive via WS push.
-			if s.wsClient != nil && s.wsClient.IsConnected() {
+			// Push normally replaces polling, but a stale response requires reconciliation.
+			if s.wsClient != nil && s.wsClient.IsConnected() && !s.wsResyncPending.Load() {
 				continue
 			}
 			nlog.Core().Debug("polling from API (ws not connected)")
@@ -646,8 +651,10 @@ func (s *Service) drainMachineMailbox(ctx context.Context) {
 }
 
 func (s *Service) requestWSResync(ctx context.Context, reason string) {
-	if !s.wsResyncPending.CompareAndSwap(false, true) {
-		return
+	s.wsResyncRevision++
+	s.wsResyncPending.Store(true)
+	if source, ok := s.source.(interface{ RequestResync() }); ok {
+		source.RequestResync()
 	}
 	if s.nodeLog != nil {
 		s.nodeLog.Warn("ws state may be stale, scheduling REST reconciliation", "reason", reason)
@@ -669,7 +676,7 @@ func (s *Service) wsMetrics() map[string]interface{} {
 // - On disconnect: record timestamp, immediately REST poll.
 // - On reconnect: clear disconnect timestamp, REST poll to catch missed events.
 func (s *Service) handleWSStatus(ctx context.Context, status controlplane.StatusChange) {
-	if status.NeedsResync {
+	if status.NeedsResync && !status.Connected {
 		s.requestWSResync(ctx, "drop_detected")
 	}
 	if status.Connected {
@@ -684,7 +691,7 @@ func (s *Service) handleWSStatus(ctx context.Context, status controlplane.Status
 		}
 		// After reconnect, proactively pull once to ensure we haven't missed
 		// any updates during the disconnection window.
-		s.pullViaAPIAsync(ctx)
+		s.requestWSResync(ctx, "reconnected")
 	} else {
 		s.metricsMu.Lock()
 		if s.wsDisconnectAt.IsZero() {
@@ -766,26 +773,9 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 		if event.Config == nil {
 			return
 		}
-		newConfigHash := computeConfigHash(event.Config)
-		if newConfigHash == s.lastConfigHash {
-			return
+		if s.applyConfigUpdate(ctx, event.Config, computeConfigHash(event.Config)) {
+			s.applyChanges(ctx, true, false)
 		}
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), event.Config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
-			return
-		}
-		// Initialize nodeLog on first config
-		if s.nodeLog == nil {
-			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
-		}
-		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
-		s.metricsMu.Lock()
-		s.lastConfig = event.Config
-		s.metricsMu.Unlock()
-		s.lastConfigHash = newConfigHash
-		s.configureTrafficLimit(event.Config)
-		s.applyRemoteOverrides(ctx, event.Config)
-		s.applyChanges(ctx, true, false)
 
 	case controlplane.EventSyncUsers:
 		if event.Users == nil {
@@ -881,26 +871,24 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		return
 	}
 
-	currentConfigHash := s.lastConfigHash
-	certChanged := s.cert.CertRenewed()
+	baseConfig := s.lastConfig
+	baseUserHash := s.lastUserHash
+	resyncRevision := s.wsResyncRevision
 
 	go func() {
-		defer s.pullActive.Store(false)
 		snapshot, err := s.source.Poll(ctx)
 		if err != nil {
 			nlog.Core().Error("poll control plane failed", "error", err)
 			s.pullBackoff.onFailure()
+			s.pullActive.Store(false)
 			return
 		}
 		s.pullBackoff.onSuccess()
 
-		result := pullResult{certChanged: certChanged}
+		result := pullResult{baseConfig: baseConfig, baseUserHash: baseUserHash, stateCaptured: true, resyncRevision: resyncRevision}
 		if snapshot.Config != nil {
 			result.config = snapshot.Config
 			result.configHash = computeConfigHash(snapshot.Config)
-			if result.configHash == currentConfigHash && !certChanged {
-				result.config = nil
-			}
 		}
 		if snapshot.Users != nil {
 			result.users = snapshot.Users
@@ -910,40 +898,42 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 		select {
 		case s.pullResults <- result:
 		case <-ctx.Done():
+			s.pullActive.Store(false)
 		}
 	}()
 }
 
 // applyPullResult processes the result of an async pullViaAPI on the main goroutine.
 func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
-	s.wsResyncPending.Store(false)
+	defer s.pullActive.Store(false)
+	if result.resyncRevision == s.wsResyncRevision {
+		s.wsResyncPending.Store(false)
+	}
+	if result.stateCaptured {
+		stale := result.resyncRevision != s.wsResyncRevision
+		if stale {
+			// A reconnect/drop request made during this poll requires a later snapshot.
+			result.config, result.users = nil, nil
+		}
+		if result.config != nil && result.baseConfig != s.lastConfig {
+			result.config = nil
+			stale = true
+		}
+		if result.users != nil && result.baseUserHash != s.lastUserHash {
+			result.users = nil
+			stale = true
+		}
+		if stale {
+			if source, ok := s.source.(interface{ RequestResync() }); ok {
+				source.RequestResync()
+			}
+			s.wsResyncPending.Store(true)
+		}
+	}
 	configChanged := false
 
-	if result.certChanged {
-		nlog.Core().Info("certificate renewed, kernel restart needed")
+	if result.config != nil && s.applyConfigUpdate(ctx, result.config, result.configHash) {
 		configChanged = true
-	}
-
-	if result.config != nil {
-		if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), result.config, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn("runtime config validation failed", "error", err)
-			result.config = nil
-		} else {
-			configChanged = true
-			// Initialize or update node logger
-			if s.nodeLog == nil {
-				s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
-			}
-			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			s.metricsMu.Lock()
-			s.lastConfig = result.config
-			s.metricsMu.Unlock()
-			s.lastConfigHash = result.configHash
-			s.configureTrafficLimit(result.config)
-			if s.applyRemoteOverrides(ctx, result.config) {
-				configChanged = true
-			}
-		}
 	}
 
 	if result.users != nil {
@@ -959,6 +949,40 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 	if configChanged {
 		s.applyChanges(ctx, true, false)
 	}
+}
+
+func (s *Service) applyCertificateRenewal(ctx context.Context, renewed bool) {
+	if renewed {
+		nlog.Core().Info("certificate renewed, applying current TLS material")
+		s.applyChanges(ctx, true, false)
+	}
+}
+
+// applyConfigUpdate keeps quota state current without reloading unchanged protocol settings.
+func (s *Service) applyConfigUpdate(ctx context.Context, nc *model.NodeSpec, configHash string) bool {
+	if err := validateNodeRuntime(s.cfg, s.kernel.Protocols(), nc, s.cert.TLSCert()); err != nil {
+		nlog.Core().Warn("runtime config validation failed", "error", err)
+		return false
+	}
+	if configHash == "" {
+		configHash = computeConfigHash(nc)
+	}
+	configChanged := configHash != s.lastConfigHash
+	if s.nodeLog == nil {
+		s.nodeLog = nlog.ForNode(nc.Protocol, nc.ServerPort)
+	}
+	s.metricsMu.Lock()
+	s.lastConfig = nc
+	s.metricsMu.Unlock()
+	s.lastConfigHash = configHash
+	s.configureTrafficLimit(nc)
+	if s.applyRemoteOverrides(ctx, nc) {
+		configChanged = true
+	}
+	if configChanged {
+		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
+	}
+	return configChanged
 }
 
 // ─── User state helpers ─────────────────────────────────────────────────────
@@ -1066,7 +1090,12 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 		return
 	}
 
-	if !s.ensureRunning() {
+	if !s.kernel.IsRunning() {
+		s.updateUserState(users)
+		if newHash != "" {
+			s.lastUserHash = newHash
+		}
+		s.ensureRunning()
 		return
 	}
 
@@ -1103,7 +1132,9 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 			return
 		}
 
-		if !s.ensureRunning() {
+		if !s.kernel.IsRunning() {
+			s.updateUserState(merged)
+			s.ensureRunning()
 			return
 		}
 
@@ -1143,6 +1174,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 
 		if !s.kernel.IsRunning() {
+			s.updateUserState(filtered)
 			return
 		}
 
@@ -1488,19 +1520,9 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	return m
 }
 
-// computeConfigHash returns a deterministic hash of the node config.
-// It uses JSON marshaling to ensure all fields are captured, ensuring that
-// any configuration change correctly triggers a kernel reload.
+// computeConfigHash tracks settings that require a protocol kernel reload.
 func computeConfigHash(cfg *model.NodeSpec) string {
-	if cfg == nil {
-		return ""
-	}
-	h := sha256.New()
-	// We marshal the entire config to be safe. Node config updates are low-frequency,
-	// so the robustness of capturing all fields outweighs the micro-performance of manual hashing.
-	data, _ := json.Marshal(cfg)
-	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil))
+	return kernel.ConfigHash(cfg)
 }
 
 // computeUserHash returns a deterministic hash of the user list for change detection.

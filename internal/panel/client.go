@@ -83,6 +83,9 @@ func (c *Client) ResetConfigETag() {
 	c.configETag = ""
 }
 
+// ResetUserETag requests a full user list after an outdated response was discarded.
+func (c *Client) ResetUserETag() { c.userETag = "" }
+
 // Handshake calls the new v2 API to get WS config + initial data in one shot.
 func (c *Client) Handshake() (*HandshakeResponse, error) {
 	resp, err := c.doRequest("POST", "/api/v2/server/handshake", nil, "")

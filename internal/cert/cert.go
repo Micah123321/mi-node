@@ -58,6 +58,7 @@ type Manager struct {
 
 	magic           *certmagic.Config
 	renewed         atomic.Bool
+	renewalEvents   chan struct{}
 	acmeStarted     bool
 	acmeFingerprint string
 	acmeCancel      context.CancelFunc
@@ -71,7 +72,7 @@ type certMaterial struct {
 
 // NewManager creates a certificate manager.
 func NewManager(cfg config.CertConfig) *Manager {
-	m := &Manager{cfg: cfg}
+	m := &Manager{cfg: cfg, renewalEvents: make(chan struct{}, 1)}
 	m.setCertPaths()
 	return m
 }
@@ -282,6 +283,17 @@ func (m *Manager) HasCert() bool {
 }
 func (m *Manager) CertRenewed() bool { return m.renewed.Swap(false) }
 
+// RenewalEvents wakes the service even when push updates have disabled REST polling.
+func (m *Manager) RenewalEvents() <-chan struct{} { return m.renewalEvents }
+
+func (m *Manager) notifyRenewal() {
+	m.renewed.Store(true)
+	select {
+	case m.renewalEvents <- struct{}{}:
+	default:
+	}
+}
+
 // TLSCert returns the current PEM material as a kernel.TLSCert.
 func (m *Manager) TLSCert() kernel.TLSCert {
 	mat := m.mat.Load()
@@ -465,7 +477,7 @@ func (m *Manager) startACME(ctx context.Context, dnsSolver *certmagic.DNS01Solve
 				nlog.Core().Error("failed to reload cert after renewal", "error", err)
 				return nil
 			}
-			m.renewed.Store(true)
+			m.notifyRenewal()
 			nlog.Core().Info("TLS certificate reloaded after renewal", "domain", m.cfg.Domain)
 			return nil
 		},

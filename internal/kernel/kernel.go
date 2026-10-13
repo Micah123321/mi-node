@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 
 	"github.com/micah123321/mi-node/internal/model"
@@ -103,12 +104,22 @@ type Kernel interface {
 	ClearGlobalDevices()
 }
 
+// ConfigHash excludes traffic quota state, which is applied without rebuilding listeners.
+func ConfigHash(nc *model.NodeSpec) string {
+	if nc == nil {
+		return ""
+	}
+	config := *nc
+	config.TrafficLimit = nil
+	data, _ := json.Marshal(config)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
 // ComputeHash returns a hash of config + user identities that would
 // require a kernel restart/reconstruction if changed.
 func ComputeHash(nc *model.NodeSpec, users []model.UserSpec) string {
 	h := sha256.New()
-	configData, _ := json.Marshal(nc)
-	h.Write(configData)
+	io.WriteString(h, ConfigHash(nc))
 	sorted := make([]model.UserSpec, len(users))
 	copy(sorted, users)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].ID < sorted[j].ID })

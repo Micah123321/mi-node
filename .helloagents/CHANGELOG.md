@@ -14,6 +14,10 @@
 
 ### 快速修改
 
+- **[service/kernel/traffic-limit]**: 修复启用节点流量限额后，已用流量等配额状态进入配置哈希导致协议入站反复重建的问题；REST 与 WS 更新继续同步限额管理器，配额变化不触发内核重载，真实协议配置变化仍正常生效；证书续期独立通知服务，迟到 REST 响应不会覆盖较新 WS 状态，首批用户到达可启动缓存协议，同周期较大用量可触发超额停用。自动重置使用计划周期边界并忽略已执行的旧计划；重连/丢包补拉按请求代次保留，旧REST结果不会吞掉新请求。
+  - 类型: 快速修改（无方案包）
+  - 验证: QUIC 开启条件下 kernel/service/trafficlimit/cert/controlplane/panel 回归通过，最终 service/controlplane 完整回归通过；旧服务代码可复现配额变化触发重载；Linux amd64 发布标签构建及 ELF 核验通过。竞态检测因当前 CGO 关闭未运行。
+
 - **[install]**: 修复 Alpine/OpenRC 安装时 OpenRC init 脚本在临时目录使用 `${TMP_DIR}/mi-node` 覆盖已下载二进制的问题；`/usr/local/bin/mi-node` 不再被替换成服务脚本，避免启动时报 `unrecognized option: c`。 — by yinjianm
   - 类型: 快速修改（无方案包）
   - 文件: install.sh:38,876-1003
