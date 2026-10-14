@@ -468,10 +468,13 @@ func (c *Client) postJSONContext(ctx context.Context, path string, payload map[s
 	defer drainAndClose(resp.Body)
 
 	if resp.StatusCode != http.StatusOK {
+		if path == "/api/v2/server/access/report" && resp.StatusCode == http.StatusGone {
+			return ErrAccessReportExpired
+		}
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("status %d: %s", resp.StatusCode, respBody)
 	}
-	if path == "/api/v2/server/report" {
+	if path == "/api/v2/server/report" || path == "/api/v2/server/access/report" {
 		var result struct {
 			Data bool `json:"data"`
 		}

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"github.com/micah123321/mi-node/internal/access"
 )
 
 // StringOrArray is a type that can unmarshal from either a JSON string or an array of strings.
@@ -146,6 +148,7 @@ type NodeConfig struct {
 
 	// TrafficLimit controls node-level monthly traffic enforcement.
 	TrafficLimit *TrafficLimitConfig `json:"traffic_limit,omitempty"`
+	AccessLog    *access.Config      `json:"access_log,omitempty"`
 }
 
 // GetProxyProtocol returns true if AcceptProxyProtocol is set either at node level

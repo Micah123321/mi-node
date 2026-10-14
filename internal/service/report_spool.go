@@ -15,14 +15,17 @@ import (
 
 // Only accounting data is persisted; credentials and transient metrics never enter the spool.
 type spoolBatch struct {
-	ReportID string           `json:"report_id"`
-	Traffic  map[int][2]int64 `json:"traffic"`
+	ReportID string                     `json:"report_id"`
+	Traffic  map[int][2]int64           `json:"traffic"`
+	Access   *controlplane.AccessReport `json:"access,omitempty"`
 }
 type reportSpool struct {
-	Version  int          `json:"version"`
-	Identity string       `json:"identity"`
-	Batches  []spoolBatch `json:"batches"`
-	Checksum string       `json:"checksum"`
+	Version        int                         `json:"version"`
+	Identity       string                      `json:"identity"`
+	Batches        []spoolBatch                `json:"batches"`
+	DeferredAccess []controlplane.AccessReport `json:"deferred_access,omitempty"`
+	Checksum       string                      `json:"checksum"`
+	AccessChecksum string                      `json:"access_checksum,omitempty"`
 }
 
 func (s *Service) spoolLocation() (string, string, error) {
@@ -37,7 +40,30 @@ func (s *Service) spoolLocation() (string, string, error) {
 }
 
 func spoolChecksum(v reportSpool) string {
-	v.Checksum = ""
+	// Match the a0499b9 wire shape, including field order and nil versus empty batches.
+	type billingBatch struct {
+		ReportID string           `json:"report_id"`
+		Traffic  map[int][2]int64 `json:"traffic"`
+	}
+	billing := struct {
+		Version  int            `json:"version"`
+		Identity string         `json:"identity"`
+		Batches  []billingBatch `json:"batches"`
+		Checksum string         `json:"checksum"`
+	}{Version: v.Version, Identity: v.Identity}
+	if v.Batches != nil {
+		billing.Batches = make([]billingBatch, len(v.Batches))
+		for i, b := range v.Batches {
+			billing.Batches[i] = billingBatch{ReportID: b.ReportID, Traffic: b.Traffic}
+		}
+	}
+	data, _ := json.Marshal(billing)
+	return fmt.Sprintf("%x", sha256.Sum256(data))
+}
+
+func spoolAccessChecksum(v reportSpool) string {
+	// Bind extensions to the identity and accounting data without changing the legacy checksum.
+	v.AccessChecksum = ""
 	data, _ := json.Marshal(v)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }
@@ -66,6 +92,17 @@ func (s *Service) loadReportSpool() error {
 	if err := json.Unmarshal(data, &v); err != nil {
 		return fmt.Errorf("decode report spool %s (preserved): %w", path, err)
 	}
+	if v.AccessChecksum == "" {
+		hasAccess := v.DeferredAccess != nil
+		for _, b := range v.Batches {
+			hasAccess = hasAccess || b.Access != nil
+		}
+		if hasAccess {
+			return fmt.Errorf("invalid report spool %s: access checksum missing (unpublished extension format; preserved)", path)
+		}
+	} else if v.AccessChecksum != spoolAccessChecksum(v) {
+		return fmt.Errorf("invalid report spool %s: access checksum mismatch (preserved)", path)
+	}
 	if v.Version != 1 || v.Identity != identity || v.Checksum != spoolChecksum(v) {
 		return fmt.Errorf("invalid report spool %s: version, identity or checksum mismatch (preserved)", path)
 	}
@@ -81,8 +118,14 @@ func (s *Service) loadReportSpool() error {
 			}
 		}
 		seen[b.ReportID] = true
-		queue = append(queue, &controlplane.ReportPayload{ReportID: b.ReportID, Traffic: b.Traffic})
+		queue = append(queue, &controlplane.ReportPayload{ReportID: b.ReportID, Traffic: b.Traffic, Access: b.Access})
 	}
+	for _, report := range v.DeferredAccess {
+		if err := validateAccessReport(report); err != nil {
+			return fmt.Errorf("invalid deferred access batch (preserved): %w", err)
+		}
+	}
+	s.deferredAccess = v.DeferredAccess
 	s.reportQueue = queue
 	if len(queue) > 0 {
 		s.pendingReport = queue[0]
@@ -98,11 +141,12 @@ func (s *Service) persistReportQueue(queue []*controlplane.ReportPayload) error 
 	if err != nil || path == "" {
 		return err
 	}
-	v := reportSpool{Version: 1, Identity: identity, Batches: make([]spoolBatch, 0, len(queue))}
+	v := reportSpool{Version: 1, Identity: identity, Batches: make([]spoolBatch, 0, len(queue)), DeferredAccess: s.deferredAccess}
 	for _, p := range queue {
-		v.Batches = append(v.Batches, spoolBatch{p.ReportID, p.Traffic})
+		v.Batches = append(v.Batches, spoolBatch{ReportID: p.ReportID, Traffic: p.Traffic, Access: p.Access})
 	}
 	v.Checksum = spoolChecksum(v)
+	v.AccessChecksum = spoolAccessChecksum(v)
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err

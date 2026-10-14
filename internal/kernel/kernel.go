@@ -111,6 +111,7 @@ func ConfigHash(nc *model.NodeSpec) string {
 	}
 	config := *nc
 	config.TrafficLimit = nil
+	config.AccessLog = nil
 	data, _ := json.Marshal(config)
 	return fmt.Sprintf("%x", sha256.Sum256(data))
 }

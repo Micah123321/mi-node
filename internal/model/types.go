@@ -1,6 +1,9 @@
 package model
 
-import "github.com/micah123321/mi-node/internal/config"
+import (
+	"github.com/micah123321/mi-node/internal/access"
+	"github.com/micah123321/mi-node/internal/config"
+)
 
 type NodeSpec struct {
 	Protocol        string
@@ -46,6 +49,7 @@ type NodeSpec struct {
 	Multiplex           *MultiplexConfig
 	AcceptProxyProtocol bool
 	TrafficLimit        *TrafficLimitSpec
+	AccessLog           *access.Config
 }
 
 type OutboundConfig struct {

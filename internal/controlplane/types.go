@@ -61,6 +61,7 @@ type ReportPayload struct {
 	Swap     [2]uint64
 	Disk     [2]uint64
 	Metrics  map[string]interface{}
+	Access   *AccessReport
 }
 
 type PushClient interface {

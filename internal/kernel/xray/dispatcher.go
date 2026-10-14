@@ -17,6 +17,7 @@ import (
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 
+	"github.com/micah123321/mi-node/internal/access"
 	"github.com/micah123321/mi-node/internal/nlog"
 )
 
@@ -55,6 +56,9 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		limitedIPs:        make(map[string]map[string]int),
 		disableDeviceGate: globalDisableXrayDeviceGate.Load(),
 	}
+	if err := installAccessOutboundHook(ctx, config, orig); err != nil {
+		return nil, err
+	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
 	return ld, nil
@@ -63,13 +67,13 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 // LimitDispatcher wraps xray's DefaultDispatcher to enforce per-user
 // admission checks before a request is dispatched into xray-core.
 //
-// It intentionally does NOT mutate transport.Link.Reader/Writer. Xray's
-// mux/XUDP close path requires the original concrete *pipe.Reader to remain
-// intact, so the dispatcher is limited to gate-keeping and safe connection
-// lifecycle bookkeeping.
+// Dispatch retains the native pipe reader required by mux/XUDP close paths.
+// Access collection decorates native writer counters and the routed outbound
+// handoff; DispatchLink retains the core's own timeout/sniff reader wrappers.
 type LimitDispatcher struct {
 	inner     interface{}        // original DefaultDispatcher (Feature + Dispatcher)
 	innerDisp routing.Dispatcher // same object, typed as Dispatcher
+	access    atomic.Pointer[access.Collector]
 
 	// limitedUsers: users with device limit > 0, protected by mu.
 	// Needs deterministic IP ordering for kick decisions.
@@ -82,7 +86,7 @@ type LimitDispatcher struct {
 	// Each entry is *ipCounter{ips sync.Map}.
 	unlimitedIPs sync.Map // email → *ipCounter
 
-	connCount atomic.Int64 // total active connections tracked by dispatcher
+	connCount         atomic.Int64 // total active connections tracked by dispatcher
 	disableDeviceGate bool
 }
 
@@ -111,6 +115,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 
+	ctx, flow := d.accessContext(ctx, dest, email)
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
 		if email != "" && isTCP {
@@ -119,6 +124,9 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 
+	if flow != nil {
+		link.Writer = wrapAccessWriter(link.Writer, flow, destinationTarget(dest), true)
+	}
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
 	}
@@ -131,6 +139,12 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		return err
 	}
 
+	ctx, flow := d.accessContext(ctx, dest, email)
+	if flow != nil {
+		// Native DispatchLink always puts its own TimeoutWrapperReader around
+		// this supplied reader. Dispatch/mux pipe readers are never replaced.
+		link.Reader = &accessReader{Reader: link.Reader, flow: flow, target: destinationTarget(dest)}
+	}
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
 	}

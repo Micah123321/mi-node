@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/micah123321/mi-node/internal/access"
 	"github.com/micah123321/mi-node/internal/bandwidthcheck"
 	"github.com/micah123321/mi-node/internal/cert"
 	"github.com/micah123321/mi-node/internal/cert/dnsproviders"
@@ -73,15 +74,24 @@ type Service struct {
 	pushBackoff    apiBackoff // backoff for panel push failures
 
 	// pushActive prevents overlapping push/pull goroutines.
-	pushActive     atomic.Bool
-	reportMu       sync.Mutex // admission only; never held during HTTP
-	reportWG       sync.WaitGroup
-	reportStopping bool
-	pendingReport  *controlplane.ReportPayload
-	reportQueue    []*controlplane.ReportPayload
-	spoolLoaded    bool
-	pullActive     atomic.Bool
-	gfwCheckActive atomic.Bool
+	pushActive        atomic.Bool
+	reportMu          sync.Mutex // admission only; never held during HTTP
+	reportWG          sync.WaitGroup
+	reportStopping    bool
+	pendingReport     *controlplane.ReportPayload
+	reportQueue       []*controlplane.ReportPayload
+	spoolLoaded       bool
+	accessMu          sync.Mutex
+	accessConfig      access.Config
+	accessPending     []access.Entry
+	accessDropped     int64
+	accessQueue       []controlplane.AccessReport
+	accessSpoolLoaded bool
+	deferredAccess    []controlplane.AccessReport
+	accessActive      atomic.Bool
+	accessBackoff     apiBackoff
+	pullActive        atomic.Bool
+	gfwCheckActive    atomic.Bool
 	// pullResults delivers async pullViaAPI results back to the main goroutine.
 	pullResults chan pullResult
 
@@ -359,6 +369,7 @@ func (s *Service) initialSetup(ctx context.Context) error {
 	s.metricsMu.Unlock()
 	s.lastConfigHash = computeConfigHash(bootstrap.Config)
 	s.configureTrafficLimit(bootstrap.Config)
+	s.configureAccess(bootstrap.Config)
 	s.updateUserState(bootstrap.Users)
 
 	nlog.Core().Info("initial snapshot ready",
@@ -976,6 +987,7 @@ func (s *Service) applyConfigUpdate(ctx context.Context, nc *model.NodeSpec, con
 	s.metricsMu.Unlock()
 	s.lastConfigHash = configHash
 	s.configureTrafficLimit(nc)
+	s.configureAccess(nc)
 	if s.applyRemoteOverrides(ctx, nc) {
 		configChanged = true
 	}
@@ -1325,6 +1337,7 @@ func (s *Service) prepareReport() error {
 	if err := s.loadReportSpool(); err != nil {
 		return err
 	}
+	s.retryDeferredAccess()
 	if s.pendingReport == nil {
 		if err := s.appendReport(); err != nil {
 			return err
@@ -1348,6 +1361,7 @@ func (s *Service) appendReport() error {
 		Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed},
 		Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics,
 	}
+	payload.Access = s.prepareAccessReport(payload.ReportID, payload.Traffic)
 	s.reportQueue = append(s.reportQueue, payload)
 	if s.pendingReport == nil {
 		s.pendingReport = payload
@@ -1361,6 +1375,13 @@ func (s *Service) sendReport(ctx context.Context) error {
 	}
 	if err := s.sink.Report(ctx, *s.pendingReport); err != nil {
 		return err
+	}
+	if s.pendingReport.Access != nil {
+		if err := s.enqueueAccessReport(*s.pendingReport.Access); err != nil {
+			// Preserve details in the accounting spool while allowing new billing batches.
+			s.deferAccessReport(*s.pendingReport.Access)
+			nlog.Core().Warn("access spool unavailable; details staged separately from billing progress", "error", err)
+		}
 	}
 	if err := s.persistReportQueue(s.reportQueue[1:]); err != nil {
 		return fmt.Errorf("acknowledge report spool: %w", err)
@@ -1376,6 +1397,9 @@ func (s *Service) sendReport(ctx context.Context) error {
 func (s *Service) pushReportAsync() {
 	s.reportMu.Lock()
 	defer s.reportMu.Unlock()
+	if !s.reportStopping {
+		s.startAccessWorkerLocked()
+	}
 	if s.reportStopping || !s.sink.SupportsReporting() || !s.pushActive.CompareAndSwap(false, true) {
 		return
 	}
@@ -1440,6 +1464,9 @@ func (s *Service) shutdownReports() error {
 		if err := s.sendReport(ctx); err != nil {
 			return errors.Join(sampleErr, fmt.Errorf("final report failed; retaining unacknowledged batches: %w", err))
 		}
+	}
+	if err := s.flushAccessReports(ctx); err != nil {
+		nlog.Core().Warn("access reports retained for retry", "error", err)
 	}
 	return sampleErr
 }

@@ -29,6 +29,7 @@ import (
 
 	_ "github.com/xtls/xray-core/main/distro/all"
 
+	"github.com/micah123321/mi-node/internal/access"
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/kernel"
 	"github.com/micah123321/mi-node/internal/kernel/geodata"
@@ -52,7 +53,8 @@ const (
 //   - instance.Start() and instance.Close() run OUTSIDE the lock.
 //   - running (atomic) gates fast-path checks in IsRunning / GetConnections.
 type Xray struct {
-	cfg config.KernelConfig
+	cfg             config.KernelConfig
+	accessCollector *access.Collector
 
 	// mu protects instance, limitDispatcher, users, protocol, inboundTag,
 	// lastKernelHash, and cumTraffic. Never held during slow I/O.
@@ -77,8 +79,9 @@ type Xray struct {
 func New(cfg config.KernelConfig) *Xray {
 	globalDisableXrayDeviceGate.Store(cfg.LowJitterDisableDeviceGate)
 	return &Xray{
-		cfg:        cfg,
-		cumTraffic: make(map[int][2]int64),
+		accessCollector: access.NewCollector(access.Config{}),
+		cfg:             cfg,
+		cumTraffic:      make(map[int][2]int64),
 	}
 }
 
@@ -132,6 +135,17 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	xrayCreationMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("create xray: %w", err)
+	}
+
+	x.mu.Lock()
+	if x.accessCollector == nil {
+		x.accessCollector = access.NewCollector(access.Config{})
+	}
+	collector := x.accessCollector
+	x.mu.Unlock()
+	if ld != nil {
+		ld.access.Store(collector)
+		configureDispatcherLimits(ld, users)
 	}
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
@@ -224,8 +238,8 @@ func tlsEqual(a, b kernel.TLSCert) bool {
 
 // GetUserTraffic returns per-user cumulative traffic from xray's built-in
 // stats pipeline and connection state from the admission dispatcher when
-// available. The dispatcher intentionally no longer wraps transport links,
-// so traffic accounting must come from xray-core itself.
+// available. Optional access hooks forward native counters unchanged; billing
+// traffic accounting continues to come from xray-core itself.
 func (x *Xray) GetUserTraffic(_ context.Context) (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int, err error) {
 	x.mu.Lock()
 	ld := x.limitDispatcher
@@ -850,6 +864,10 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 		return
 	}
 
+	configureDispatcherLimits(ld, users)
+}
+
+func configureDispatcherLimits(ld *LimitDispatcher, users []model.UserSpec) {
 	emailToUID := make(map[string]int, len(users)*2)
 	deviceLimits := make(map[string]int)
 

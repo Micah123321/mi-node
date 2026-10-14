@@ -1,6 +1,7 @@
 package model
 
 import (
+	"github.com/micah123321/mi-node/internal/access"
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/panel"
 )
@@ -139,6 +140,7 @@ func NodeSpecFromPanel(nc *panel.NodeConfig) *NodeSpec {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: nc.AcceptProxyProtocol,
 		TrafficLimit:        trafficLimit,
+		AccessLog:           cloneAccessConfig(nc.AccessLog),
 	}
 }
 
@@ -295,7 +297,16 @@ func (n *NodeSpec) ToPanel() *panel.NodeConfig {
 		Multiplex:           multiplex,
 		AcceptProxyProtocol: n.AcceptProxyProtocol,
 		TrafficLimit:        trafficLimit,
+		AccessLog:           cloneAccessConfig(n.AccessLog),
 	}
+}
+
+func cloneAccessConfig(src *access.Config) *access.Config {
+	if src == nil {
+		return nil
+	}
+	copy := *src
+	return &copy
 }
 
 func UserSpecsToPanel(users []UserSpec) []panel.User {
