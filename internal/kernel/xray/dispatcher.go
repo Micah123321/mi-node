@@ -82,17 +82,31 @@ type LimitDispatcher struct {
 	deviceLimits map[string]int            // email → max devices
 	emailToUID   map[string]int            // email → panel user ID
 
-	// unlimitedIPs: users without device limit — sync.Map for lock-free access.
+	// unlimitedIPs: per-user containers; membership changes under their own lock.
 	// Each entry is *ipCounter{ips sync.Map}.
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount         atomic.Int64 // total active connections tracked by dispatcher
 	disableDeviceGate bool
+	connEpoch         uint64 // protected by mu; invalidates leases on reset
 }
 
-// ipCounter tracks IPs for unlimited users without any lock.
+// ipCounter serializes admission and retirement for a single unlimited user.
 type ipCounter struct {
-	ips sync.Map // sourceIP → *atomic.Int64 (refcount)
+	mu      sync.Mutex
+	refs    int
+	retired bool
+	ips     sync.Map // sourceIP -> *atomic.Int64 (refcount)
+}
+
+// connectionLease owns the exact admission state, independent of later limits.
+type connectionLease struct {
+	email, sourceIP string
+	epoch           uint64
+	limited         map[string]int
+	unlimited       *ipCounter
+	tracked         bool // protected by dispatcher.mu
+	closed          atomic.Bool
 }
 
 // aliveIPs returns a snapshot of distinct IPs.
@@ -110,7 +124,7 @@ func (ic *ipCounter) aliveIPs() map[string]bool {
 // ─── routing.Dispatcher ──────────────────────────────────────────────────────
 
 func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*transport.Link, error) {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, lease, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return nil, err
 	}
@@ -118,9 +132,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 	ctx, flow := d.accessContext(ctx, dest, email)
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
-		if email != "" && isTCP {
-			d.delConn(email, sourceIP)
-		}
+		d.delConn(lease)
 		return nil, err
 	}
 
@@ -128,13 +140,13 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		link.Writer = wrapAccessWriter(link.Writer, flow, destinationTarget(dest), true)
 	}
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		d.trackLink(link, lease)
 	}
 	return link, nil
 }
 
 func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination, link *transport.Link) error {
-	email, sourceIP, isTCP, err := d.identifyAndCheck(ctx, dest)
+	email, lease, err := d.identifyAndCheck(ctx, dest)
 	if err != nil {
 		return err
 	}
@@ -146,46 +158,49 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 		link.Reader = &accessReader{Reader: link.Reader, flow: flow, target: destinationTarget(dest)}
 	}
 	if email != "" {
-		d.trackLink(link, email, sourceIP, isTCP)
+		d.trackLink(link, lease)
 	}
-	return d.innerDisp.DispatchLink(ctx, dest, link)
+	err = d.innerDisp.DispatchLink(ctx, dest, link)
+	if err != nil {
+		d.delConn(lease)
+	}
+	return err
 }
 
-// identifyAndCheck extracts user identity from the session context, enforces
-// device limits, and returns the user's email, source IP, and TCP flag.
-// Returns a non-nil error only when the connection should be rejected.
-func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email, sourceIP string, isTCP bool, err error) {
+// identifyAndCheck extracts identity and binds lifecycle to admission state.
+func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destination) (email string, lease *connectionLease, err error) {
 	si := session.InboundFromContext(ctx)
 	if si == nil || si.User == nil || len(si.User.Email) == 0 {
-		return "", "", false, nil
+		return "", nil, nil
 	}
 	email = si.User.Email
-	sourceIP = si.Source.Address.IP().String()
-	isTCP = dest.Network == net.Network_TCP
-
-	if !d.disableDeviceGate && d.checkDeviceLimit(email, sourceIP, isTCP) {
-		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
-		return "", "", false, errors.New("device limit exceeded for " + email)
+	if d.disableDeviceGate {
+		d.mu.RLock()
+		lease = &connectionLease{epoch: d.connEpoch}
+		d.mu.RUnlock()
+		return email, lease, nil
 	}
-	return email, sourceIP, isTCP, nil
+	sourceIP := si.Source.Address.IP().String()
+	lease, rejected := d.checkDeviceLimit(email, sourceIP, dest.Network == net.Network_TCP)
+	if rejected {
+		nlog.Core().Debug("xray: device limit exceeded", "email", email, "ip", sourceIP)
+		return "", nil, errors.New("device limit exceeded for " + email)
+	}
+	return email, lease, nil
 }
 
-// trackLink records connection lifecycle without mutating xray-core owned
-// transport primitives. This keeps mux/XUDP compatible while still allowing
-// the dispatcher to release device-limit state when the link closes.
-func (d *LimitDispatcher) trackLink(link *transport.Link, email, sourceIP string, isTCP bool) {
-	d.connCount.Add(1)
-
-	onClose := func() {
-		if isTCP {
-			d.delConn(email, sourceIP)
-		}
-		d.connCount.Add(-1)
+// trackLink leaves core-owned readers intact for mux/XUDP close paths.
+func (d *LimitDispatcher) trackLink(link *transport.Link, lease *connectionLease) {
+	d.mu.Lock()
+	if lease.epoch == d.connEpoch && !lease.closed.Load() && !lease.tracked {
+		lease.tracked = true
+		d.connCount.Add(1)
 	}
+	d.mu.Unlock()
 
 	link.Writer = &closeTrackingWriter{
 		Writer:  link.Writer,
-		onClose: onClose,
+		onClose: func() { d.delConn(lease) },
 	}
 }
 
@@ -219,15 +234,10 @@ func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, 
 
 func (d *LimitDispatcher) ResetConns() {
 	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.connEpoch++
 	d.limitedIPs = make(map[string]map[string]int)
-	d.mu.Unlock()
-
-	// Clear unlimited IPs
-	d.unlimitedIPs.Range(func(key, _ interface{}) bool {
-		d.unlimitedIPs.Delete(key)
-		return true
-	})
-
+	d.unlimitedIPs.Clear()
 	d.connCount.Store(0)
 }
 
@@ -235,9 +245,9 @@ func (d *LimitDispatcher) ResetConns() {
 // Traffic bytes are intentionally left to xray's built-in stats pipeline.
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
 	d.mu.RLock()
+	defer d.mu.RUnlock()
 	emailToUID := d.emailToUID
 	limitedIPs := d.limitedIPs
-	d.mu.RUnlock()
 
 	aliveIPs = make(map[int]map[string]bool)
 
@@ -256,7 +266,7 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 		}
 	}
 
-	// Collect IPs from unlimited users (lock-free).
+	// Collect unlimited IPs while reset and the UID mapping remain stable.
 	d.unlimitedIPs.Range(func(key, value interface{}) bool {
 		email := key.(string)
 		uid := emailToUID[email]
@@ -283,123 +293,135 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
-// checkDeviceLimit enforces per-user device limits.
-// Fast path: unlimited users use lock-free sync.Map.
-// Slow path: limited users use RWMutex with deterministic IP ordering.
-func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) bool {
-	d.mu.RLock()
-	limit, hasLimit := d.deviceLimits[email]
-	d.mu.RUnlock()
-
-	// Fast path: no device limit — use lock-free sync.Map.
-	if !hasLimit || limit <= 0 {
-		if isTCP {
-			v, _ := d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
-			ic := v.(*ipCounter)
-
-			// Increment IP refcount atomically.
-			rv, _ := ic.ips.LoadOrStore(sourceIP, &atomic.Int64{})
-			rv.(*atomic.Int64).Add(1)
-		}
-		return false
-	}
-
-	// Slow path: user has device limit — need deterministic ordering.
-	d.mu.RLock()
-	ips := d.limitedIPs[email]
-	if ips != nil && ips[sourceIP] > 0 {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-
-	if ips != nil && len(ips) < limit {
-		d.mu.RUnlock()
-		if isTCP {
-			d.mu.Lock()
-			if d.limitedIPs[email] == nil {
-				d.limitedIPs[email] = make(map[string]int)
-			}
-			d.limitedIPs[email][sourceIP]++
-			d.mu.Unlock()
-		}
-		return false
-	}
-	d.mu.RUnlock()
-
-	// Over limit — need write lock for deterministic check.
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// Re-check under write lock.
-	ips = d.limitedIPs[email]
-	if ips == nil {
-		ips = make(map[string]int)
-		d.limitedIPs[email] = ips
-	}
-
-	if ips[sourceIP] > 0 {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
-	}
-
-	if len(ips) < limit {
-		if isTCP {
-			ips[sourceIP]++
-		}
-		return false
-	}
-
-	// Over limit — deterministic: allow lowest IPs lexicographically.
-	ipList := make([]string, 0, len(ips)+1)
-	for ip := range ips {
-		ipList = append(ipList, ip)
-	}
-	ipList = append(ipList, sourceIP)
-	sort.Strings(ipList)
-
-	for i := 0; i < limit && i < len(ipList); i++ {
-		if ipList[i] == sourceIP {
+// checkDeviceLimit returns a lease for the actual admission container.
+func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) (*connectionLease, bool) {
+	for {
+		d.mu.RLock()
+		limit := d.deviceLimits[email]
+		if limit <= 0 {
+			lease := &connectionLease{email: email, sourceIP: sourceIP, epoch: d.connEpoch}
 			if isTCP {
-				ips[sourceIP]++
+				for {
+					v, ok := d.unlimitedIPs.Load(email)
+					if !ok {
+						v, _ = d.unlimitedIPs.LoadOrStore(email, &ipCounter{})
+					}
+					ic := v.(*ipCounter)
+					ic.mu.Lock()
+					if ic.retired {
+						ic.mu.Unlock()
+						continue
+					}
+					rv, ok := ic.ips.Load(sourceIP)
+					if !ok {
+						rv = &atomic.Int64{}
+						ic.ips.Store(sourceIP, rv)
+					}
+					rv.(*atomic.Int64).Add(1)
+					ic.refs++
+					lease.unlimited = ic
+					ic.mu.Unlock()
+					break
+				}
 			}
-			return false
+			d.mu.RUnlock()
+			return lease, false
 		}
+		d.mu.RUnlock()
+
+		// Check and register atomically; limits may change during lock upgrade.
+		d.mu.Lock()
+		limit = d.deviceLimits[email]
+		if limit <= 0 {
+			d.mu.Unlock()
+			continue
+		}
+		ips := d.limitedIPs[email]
+		active := ips
+		if v, ok := d.unlimitedIPs.Load(email); ok {
+			active = make(map[string]int, len(ips))
+			for ip, count := range ips {
+				active[ip] = count
+			}
+			for ip := range v.(*ipCounter).aliveIPs() {
+				active[ip]++
+			}
+		}
+		if active[sourceIP] <= 0 && len(active) >= limit {
+			// Preserve the original lexicographic admission policy.
+			ipList := make([]string, 0, len(active)+1)
+			for ip := range active {
+				ipList = append(ipList, ip)
+			}
+			ipList = append(ipList, sourceIP)
+			sort.Strings(ipList)
+			allowed := false
+			for _, ip := range ipList[:limit] {
+				if ip == sourceIP {
+					allowed = true
+					break
+				}
+			}
+			if !allowed {
+				d.mu.Unlock()
+				return nil, true
+			}
+		}
+		lease := &connectionLease{email: email, sourceIP: sourceIP, epoch: d.connEpoch}
+		if isTCP {
+			if ips == nil {
+				ips = make(map[string]int)
+				d.limitedIPs[email] = ips
+			}
+			ips[sourceIP]++
+			lease.limited = ips
+		}
+		d.mu.Unlock()
+		return lease, false
 	}
-	return true
 }
 
-// delConn decrements the IP refcount when a connection closes.
-func (d *LimitDispatcher) delConn(email, sourceIP string) {
-	// Check if this is an unlimited user first (lock-free).
-	if v, ok := d.unlimitedIPs.Load(email); ok {
-		ic := v.(*ipCounter)
-		if rv, ok := ic.ips.Load(sourceIP); ok {
-			counter := rv.(*atomic.Int64)
-			if counter.Add(-1) <= 0 {
-				ic.ips.Delete(sourceIP)
-			}
-		}
+// delConn releases a lease once, without consulting the current device limit.
+func (d *LimitDispatcher) delConn(lease *connectionLease) {
+	if lease == nil || !lease.closed.CompareAndSwap(false, true) {
 		return
 	}
-
-	// Limited user — use write lock.
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if ips, ok := d.limitedIPs[email]; ok {
-		ips[sourceIP]--
-		if ips[sourceIP] <= 0 {
-			delete(ips, sourceIP)
+	if lease.limited != nil {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+	} else {
+		d.mu.RLock()
+		defer d.mu.RUnlock()
+	}
+	if lease.epoch != d.connEpoch {
+		return
+	}
+	if ic := lease.unlimited; ic != nil {
+		ic.mu.Lock()
+		if rv, ok := ic.ips.Load(lease.sourceIP); ok {
+			if rv.(*atomic.Int64).Add(-1) == 0 {
+				ic.ips.Delete(lease.sourceIP)
+			}
+		}
+		ic.refs--
+		if ic.refs == 0 {
+			// Admissions that already loaded this container must retry.
+			ic.retired = true
+			d.unlimitedIPs.CompareAndDelete(lease.email, ic)
+		}
+		ic.mu.Unlock()
+	}
+	if ips := lease.limited; ips != nil {
+		ips[lease.sourceIP]--
+		if ips[lease.sourceIP] == 0 {
+			delete(ips, lease.sourceIP)
 		}
 		if len(ips) == 0 {
-			delete(d.limitedIPs, email)
+			delete(d.limitedIPs, lease.email)
 		}
+	}
+	if lease.tracked {
+		d.connCount.Add(-1)
 	}
 }
 

@@ -44,6 +44,9 @@ type userStats struct {
 func (u *userStats) addConn(sourceIP string) {
 	u.mu.Lock()
 	u.connCount++
+	if u.ips == nil {
+		u.ips = make(map[string]int)
+	}
 	u.ips[sourceIP]++
 	u.mu.Unlock()
 }
@@ -55,6 +58,10 @@ func (u *userStats) removeConn(sourceIP string) {
 	u.ips[sourceIP]--
 	if u.ips[sourceIP] <= 0 {
 		delete(u.ips, sourceIP)
+	}
+	if u.connCount == 0 {
+		// Clearing keys alone retains the map's capacity after an IP burst.
+		u.ips = nil
 	}
 	u.mu.Unlock()
 }
@@ -123,13 +130,18 @@ func (u *userStats) aliveIPList() map[string]bool {
 //   - Close callback to decrement IP refcounts
 //   - Per-connection rate limit token accumulation (amortized WaitN)
 type ConnTracker struct {
-	access  *access.Collector
-	usersMu sync.RWMutex
-	users   map[int]*userStats  // userID → stats
-	uuidMap map[string]int      // UUID → userID (for lookup in RoutedConnection)
-	connMap map[string]net.Conn // connID → conn (only for force-close support)
+	access   *access.Collector
+	usersMu  sync.RWMutex
+	users    map[int]*userStats  // userID → stats
+	uuidMap  map[string]int      // UUID → userID (for lookup in RoutedConnection)
+	connMap  map[string]net.Conn // connID → conn (only for force-close support)
+	connPeak int                 // highest occupancy since the last index rebuild
 
 	idCounter atomic.Int64
+
+	// Size fresh snapshots from recent activity, rather than all configured users.
+	lastTrafficUsers atomic.Int64
+	lastOnlineUsers  atomic.Int64
 
 	// speedLimitFunc resolves a user UUID to a *rate.Limiter.
 	speedLimitFunc atomic.Pointer[func(uuid string) *rate.Limiter]
@@ -178,7 +190,7 @@ func (t *ConnTracker) SetUserMap(m map[string]int) {
 	t.uuidMap = m
 	for _, uid := range m {
 		if _, ok := t.users[uid]; !ok {
-			t.users[uid] = &userStats{ips: make(map[string]int)}
+			t.users[uid] = &userStats{}
 		}
 	}
 	t.usersMu.Unlock()
@@ -250,6 +262,9 @@ func (t *ConnTracker) RoutedConnection(
 	// Store conn reference for force-close support
 	t.usersMu.Lock()
 	t.connMap[connID] = conn
+	if size := len(t.connMap); size > t.connPeak {
+		t.connPeak = size
+	}
 	t.usersMu.Unlock()
 
 	var lim *rate.Limiter
@@ -433,8 +448,8 @@ func formatInt36(n int64) string {
 // This is O(users), not O(connections).
 func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[int]map[string]bool, connCount int) {
 	t.usersMu.RLock()
-	traffic = make(map[int][2]int64, len(t.users))
-	aliveIPs = make(map[int]map[string]bool, len(t.users))
+	traffic = make(map[int][2]int64, min(len(t.users), int(t.lastTrafficUsers.Load())))
+	aliveIPs = make(map[int]map[string]bool, min(len(t.users), int(t.lastOnlineUsers.Load())))
 	for uid, us := range t.users {
 		up := us.upload.Load()
 		down := us.download.Load()
@@ -451,6 +466,8 @@ func (t *ConnTracker) GetUserTraffic() (traffic map[int][2]int64, aliveIPs map[i
 		connCount += us.connCount
 		us.mu.Unlock()
 	}
+	t.lastTrafficUsers.Store(int64(len(traffic)))
+	t.lastOnlineUsers.Store(int64(len(aliveIPs)))
 	t.usersMu.RUnlock()
 	return
 }
@@ -494,6 +511,16 @@ func (t *ConnTracker) ActiveCount() int {
 func (t *ConnTracker) removeConnRef(connID string) {
 	t.usersMu.Lock()
 	delete(t.connMap, connID)
+	// Map deletion does not release peak capacity. Rebuild only after a fourfold
+	// drop, keeping small tables to avoid reallocating on every short connection.
+	if t.connPeak >= 256 && len(t.connMap) < t.connPeak/4 {
+		remaining := make(map[string]net.Conn, len(t.connMap))
+		for id, conn := range t.connMap {
+			remaining[id] = conn
+		}
+		t.connMap = remaining
+		t.connPeak = len(remaining)
+	}
 	t.usersMu.Unlock()
 }
 

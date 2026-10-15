@@ -1,0 +1,28 @@
+[Unit]
+Description=mi-node standalone Snell TCP v4 Agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=snell-agent
+Group=snell-agent
+StateDirectory=snell-agent
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/snell-agent
+ExecStart=/usr/local/bin/snell-agent -config /etc/snell-agent/config.json
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+LimitNOFILE=65536
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/snell-agent
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

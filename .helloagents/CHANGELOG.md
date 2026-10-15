@@ -14,6 +14,12 @@
 
 ### 快速修改
 
+- **[kernel/xray/http-billing]**: 修复原生 HTTP 按认证用户名(UUID)记录计数器、聚合却只查询user@ID导致用户流量始终为0的问题；按协议追踪真实计数器身份并保留至旧实例排空，AddUsers首次更新前先保存计费和身份，避免旧UUID尾流量漏记；HTTP用户名与另一UID规范email同名时按真实用户名归属，其他协议仍使用user@ID。新增普通HTTP转发、双用户CONNECT、重复采样、停止尾流量和用户替换/移除的真实TCP回归，以及身份轮换/碰撞/隔离单元测试。Windows和Linux 0/1/100/500连接实验均通过，最终上传24641/下载49641字节全额一致；保留Linux原生splice下载在连接结束时提交计数的行为。发布标签kernel/service/tracker/cmd回归和Linux Xray竞态通过；普通HTTP补充用例单独通过Windows及Linux竞态。未部署。
+
+- **[memory/connections]**: 用户补充连接数增长场景后，追加 sing-box 连接索引高峰容量回收：四分之一迟滞重建，小表保留以减少短连接抖动。5万条模拟连接正常关闭后，跟踪层新增残留堆由约2.63MB降至10～46KB（Windows Go1.26.4三次采样，含运行时噪声，不代表进程RSS）。并发准入/关闭、存活连接计费/强制关闭及Linux竞态回归通过；新增默认跳过的独立子进程连接实验；Windows/Linux双内核VLESS/TCP 0/100/500/关闭/再次GC均通过回显、计费和回收检查。Linux活跃堆：sing-box 2.20→4.71→2.73MiB，Xray 2.42→13.28→3.33MiB；RSS仍可较高，采样用GC仅存在于实验。额外复现既有Xray HTTP按UUID认证而按user@ID取计费导致0统计，失败记录保留，未扩展运行时代码修复。真实连接JSON及说明位于output/memory-optimization/。
+
+- **[memory/kernel/service/tracker]**: 减少长时间运行的内存保留：去掉统计周期未使用的流量副本并收缩历史基线；sing-box 按需分配和释放空闲 IP 表，采样容量跟随实际活动；Xray 连接按准入租约幂等回收原计数容器，修复限额热更新残留与快照读取竞态；上报 ACK 持久化后及明细过期/恢复后清零队列旧槽。保留累计计费和失败重试。1万用户基准：tracker采样437KB/op→96B/op，sing-box空闲采样733KB/op→96B/op、初始化1.71MB→1.23MB。全模块/命令回归、发布标签内核/上报回归及Linux CGO竞态检查通过；Linux amd64编译成功，后续二进制文件缺失，版本探测与SHA未完成；未线上部署。复现与基准记录位于output/memory-optimization/verification.md。
+
 - **[service/kernel/traffic-limit]**: 修复启用节点流量限额后，已用流量等配额状态进入配置哈希导致协议入站反复重建的问题；REST 与 WS 更新继续同步限额管理器，配额变化不触发内核重载，真实协议配置变化仍正常生效；证书续期独立通知服务，迟到 REST 响应不会覆盖较新 WS 状态，首批用户到达可启动缓存协议，同周期较大用量可触发超额停用。自动重置使用计划周期边界并忽略已执行的旧计划；重连/丢包补拉按请求代次保留，旧REST结果不会吞掉新请求。
   - 类型: 快速修改（无方案包）
   - 验证: QUIC 开启条件下 kernel/service/trafficlimit/cert/controlplane/panel 回归通过，最终 service/controlplane 完整回归通过；旧服务代码可复现配额变化触发重载；Linux amd64 发布标签构建及 ELF 核验通过。竞态检测因当前 CGO 关闭未运行。

@@ -1,0 +1,11 @@
+{
+  "panel_url": "https://panel.example.com",
+  "token": "REPLACE_WITH_PANEL_SERVER_TOKEN",
+  "node_id": 1,
+  "pull_interval": "30s",
+  "report_interval": "60s",
+  "state_dir": "/var/lib/snell-agent",
+  "stale_after": "5m",
+  "listen_ip": "0.0.0.0",
+  "request_timeout": "10s"
+}

@@ -1,0 +1,94 @@
+name: Snell Agent Release
+on:
+  push:
+    branches: [dev, main, master]
+    paths: ['snell-agent/**', '.github/workflows/snell-agent-release.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: snell-agent
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: snell-agent/go.sum
+      - name: Verify module and race tests
+        env:
+          GOWORK: 'off'
+          CGO_ENABLED: '1'
+        run: |
+          go mod download
+          go mod verify
+          go test -race ./...
+          go vet ./...
+  build:
+    runs-on: ubuntu-latest
+    needs: test
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: snell-agent/go.sum
+      - name: Build standalone binary
+        working-directory: snell-agent
+        env:
+          GOWORK: 'off'
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -o dist/snell-agent-linux-${GOARCH} ./cmd/snell-agent
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snell-agent-linux-${{ matrix.arch }}
+          path: snell-agent/dist/snell-agent-linux-${{ matrix.arch }}
+          if-no-files-found: error
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache-dependency-path: snell-agent/go.sum
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: snell-agent-linux-*
+          merge-multiple: true
+          path: dist
+      - name: Bundle deployment files and dependency license
+        working-directory: snell-agent
+        env:
+          GOWORK: 'off'
+        run: |
+          go mod download github.com/missuo/opensnell
+          dependency=$(go list -m -f '{{.Dir}}' github.com/missuo/opensnell)
+          cp "$dependency/LICENSE.md" ../dist/OPENSNELL-LICENSE
+          cp README.md ../dist/README.md
+          cp deploy/snell-agent.service ../dist/snell-agent.service
+          cp config.example.json ../dist/config.example.json
+          printf '%s\n' "$GITHUB_SHA" > ../dist/SOURCE_REVISION
+          cd ../dist
+          chmod +x snell-agent-linux-amd64
+          ./snell-agent-linux-amd64 -h
+          sha256sum snell-agent-linux-* OPENSNELL-LICENSE README.md snell-agent.service config.example.json SOURCE_REVISION > SHA256SUMS
+      - name: Publish separate Snell prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="snell-v$(date -u +%Y%m%d).${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+          gh release create "$version" dist/* --target "$GITHUB_SHA" --title "$version" --prerelease --latest=false --generate-notes

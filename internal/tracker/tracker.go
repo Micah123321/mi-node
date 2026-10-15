@@ -13,7 +13,6 @@ import (
 // snapshot is an immutable point-in-time view of tracker state.
 // It is swapped atomically so readers never block writers.
 type snapshot struct {
-	traffic   map[int][2]int64        // userID → [upload, download] delta
 	aliveIPs  map[int]map[string]bool // userID → set of source IPs
 	online    map[int]int             // userID → distinct IP count
 	connCount int
@@ -29,11 +28,9 @@ type snapshot struct {
 // Tracker computes deltas against the previous cycle's values — O(users),
 // not O(connections).
 //
-// Thread safety: Process() acquires mu to update internal state, then
-// atomically publishes a new snapshot. All read methods (Flush*,
-// CurrentOnline, LogStats, *Speed) read the snapshot lock-free.
-// This eliminates contention between the 10s Process tick and the 60s
-// flush/push tick.
+// Thread safety: Process() and traffic flushes share mu. Online/connection
+// readers use an immutable snapshot; pending traffic stays in one owned map
+// until FlushTraffic hands it to the report worker.
 type Tracker struct {
 	mu sync.Mutex
 
@@ -60,7 +57,6 @@ func New() *Tracker {
 	}
 	// Publish initial empty snapshot.
 	t.live.Store(&snapshot{
-		traffic:  make(map[int][2]int64),
 		aliveIPs: make(map[int]map[string]bool),
 		online:   make(map[int]int),
 	})
@@ -81,9 +77,19 @@ func (t *Tracker) Process(
 	defer t.mu.Unlock()
 
 	var cycleIn, cycleOut int64
+	previous := t.lastSeen
+	missing := len(previous)
+	// Rebuild after a large population drop so the map can release peak capacity.
+	rebuild := len(cumTraffic) < len(previous)/2
+	if rebuild {
+		t.lastSeen = make(map[int][2]int64, len(cumTraffic))
+	}
 
 	for uid, cum := range cumTraffic {
-		prev := t.lastSeen[uid]
+		prev, seen := previous[uid]
+		if seen {
+			missing--
+		}
 		deltaUp := cum[0] - prev[0]
 		deltaDown := cum[1] - prev[1]
 
@@ -108,6 +114,16 @@ func (t *Tracker) Process(
 		}
 	}
 
+	// Successful kernel snapshots are complete; absent counters no longer have a
+	// baseline. Pending bytes remain independent until acknowledged by reporting.
+	if missing > 0 && !rebuild {
+		for uid := range t.lastSeen {
+			if _, present := cumTraffic[uid]; !present {
+				delete(t.lastSeen, uid)
+			}
+		}
+	}
+
 	// Compute online from alive IPs.
 	online := make(map[int]int, len(kernelAliveIPs))
 	for uid, ips := range kernelAliveIPs {
@@ -116,7 +132,6 @@ func (t *Tracker) Process(
 
 	// Publish new snapshot (readers will see this atomically).
 	t.live.Store(&snapshot{
-		traffic:   copyTrafficMap(t.pendingTraffic),
 		aliveIPs:  kernelAliveIPs, // kernel provides fresh copy each tick
 		online:    online,
 		connCount: connCount,
@@ -128,7 +143,7 @@ func (t *Tracker) Process(
 }
 
 // FlushTraffic returns accumulated per-user traffic and resets the pending buffer.
-// Lock-free: reads from live snapshot, then acquires mu only to drain.
+// The returned map belongs to the caller; later samples use a fresh buffer.
 func (t *Tracker) FlushTraffic() map[int][2]int64 {
 	t.mu.Lock()
 	data := t.pendingTraffic
@@ -259,13 +274,4 @@ func (t *Tracker) InboundSpeed() int64 {
 // Lock-free: reads from live snapshot.
 func (t *Tracker) OutboundSpeed() int64 {
 	return t.live.Load().outSpeed / 10
-}
-
-// copyTrafficMap creates a shallow copy of the traffic map.
-func copyTrafficMap(src map[int][2]int64) map[int][2]int64 {
-	dst := make(map[int][2]int64, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
 }

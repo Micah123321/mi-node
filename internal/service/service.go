@@ -1386,7 +1386,12 @@ func (s *Service) sendReport(ctx context.Context) error {
 	if err := s.persistReportQueue(s.reportQueue[1:]); err != nil {
 		return fmt.Errorf("acknowledge report spool: %w", err)
 	}
+	// Drop the backing-array reference only after the durable ACK succeeds.
+	s.reportQueue[0] = nil
 	s.reportQueue = s.reportQueue[1:]
+	if len(s.reportQueue) == 0 {
+		s.reportQueue = nil
+	}
 	s.pendingReport = nil
 	if len(s.reportQueue) > 0 {
 		s.pendingReport = s.reportQueue[0]

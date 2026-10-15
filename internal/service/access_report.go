@@ -185,6 +185,7 @@ func (s *Service) enqueueAccessReport(report controlplane.AccessReport) error {
 	if len(queue) > 512 {
 		// Bound disk usage during extended outages. The next report exposes the gap.
 		s.accessDropped += int64(len(queue[0].Entries))
+		clear(queue[:len(queue)-512])
 		queue = queue[len(queue)-512:]
 		nlog.Core().Warn("access spool backlog limit reached; oldest detail batch expired")
 	}
@@ -200,6 +201,7 @@ func (s *Service) enqueueAccessReport(report controlplane.AccessReport) error {
 			return fmt.Errorf("access batch exceeds spool capacity")
 		}
 		s.accessDropped += int64(len(queue[0].Entries))
+		queue[0] = controlplane.AccessReport{}
 		queue = queue[1:]
 		nlog.Core().Warn("access spool byte limit reached; oldest detail batch expired")
 	}
@@ -227,7 +229,11 @@ func (s *Service) deferAccessReport(report controlplane.AccessReport) {
 		s.accessMu.Lock()
 		s.accessDropped += int64(len(s.deferredAccess[0].Entries))
 		s.accessMu.Unlock()
+		s.deferredAccess[0] = controlplane.AccessReport{}
 		s.deferredAccess = s.deferredAccess[1:]
+		if len(s.deferredAccess) == 0 {
+			s.deferredAccess = nil
+		}
 		nlog.Core().Warn("deferred access capacity reached; oldest details expired")
 	}
 }
@@ -237,7 +243,11 @@ func (s *Service) retryDeferredAccess() {
 		if err := s.enqueueAccessReport(s.deferredAccess[0]); err != nil {
 			return
 		}
+		s.deferredAccess[0] = controlplane.AccessReport{}
 		s.deferredAccess = s.deferredAccess[1:]
+		if len(s.deferredAccess) == 0 {
+			s.deferredAccess = nil
+		}
 	}
 }
 
@@ -297,7 +307,11 @@ func (s *Service) sendAccessReport(ctx context.Context) error {
 		if err := s.persistAccessQueueLocked(s.accessQueue[1:]); err != nil {
 			return err
 		}
+		s.accessQueue[0] = controlplane.AccessReport{}
 		s.accessQueue = s.accessQueue[1:]
+		if len(s.accessQueue) == 0 {
+			s.accessQueue = nil
+		}
 	}
 	return nil
 }

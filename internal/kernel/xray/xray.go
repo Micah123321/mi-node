@@ -68,7 +68,7 @@ type Xray struct {
 	inboundTag      string
 	lastKernelHash  string
 	cumTraffic      map[int][2]int64
-	statsUsers      map[int]struct{} // includes removed users until this instance closes
+	statsEmails     map[string]int // counter email -> user ID, retained until this instance closes
 	speedLimitFunc  func(string) *rate.Limiter
 
 	// running is set after a successful Start and cleared before shutdown.
@@ -162,7 +162,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	closeOld(old, oldLD)
 	x.mu.Lock()
 	_, _ = x.aggregateStats()
-	x.statsUsers = nil
+	x.statsEmails = nil
 	x.instance = inst
 	x.limitDispatcher = ld
 	x.users = users
@@ -224,7 +224,7 @@ func (x *Xray) Stop() {
 	_, _ = x.aggregateStats()
 	x.instance = nil
 	x.limitDispatcher = nil
-	x.statsUsers = nil
+	x.statsEmails = nil
 	x.mu.Unlock()
 }
 
@@ -302,6 +302,9 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.mu.Unlock()
 		return 0, fmt.Errorf("not running")
 	}
+
+	// Preserve counter identities before metadata changes, even before the first poll.
+	_, _ = x.aggregateStats()
 
 	// Merge: overwrite existing users' properties, collect truly new ones.
 	userMap := make(map[int]model.UserSpec, len(x.users))
@@ -791,18 +794,27 @@ func (x *Xray) aggregateStats() (map[int][2]int64, error) {
 	if x.cumTraffic == nil {
 		x.cumTraffic = make(map[int][2]int64)
 	}
-	if x.statsUsers == nil {
-		x.statsUsers = make(map[int]struct{})
+	if x.statsEmails == nil {
+		x.statsEmails = make(map[string]int)
 	}
 	for _, u := range x.users {
-		x.statsUsers[u.ID] = struct{}{}
+		email := userEmail(u.ID)
+		// Native HTTP uses the authenticated username, not the config's email.
+		// Pick its actual identity so a username matching another UID stays distinct.
+		if x.protocol == "http" {
+			email = u.UUID
+		}
+		if email != "" {
+			// Retain old identities until draining completes for late connection bytes.
+			x.statsEmails[email] = u.ID
+		}
 	}
 	if x.instance != nil {
 		if mgr, ok := x.instance.GetFeature(stats.ManagerType()).(stats.Manager); ok {
-			for uid := range x.statsUsers {
+			for email, uid := range x.statsEmails {
 				cum := x.cumTraffic[uid]
 				for i, direction := range []string{"uplink", "downlink"} {
-					if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>%s", userEmail(uid), direction)); c != nil {
+					if c := mgr.GetCounter(fmt.Sprintf("user>>>%s>>>traffic>>>%s", email, direction)); c != nil {
 						cum[i] += c.Set(0)
 					}
 				}
