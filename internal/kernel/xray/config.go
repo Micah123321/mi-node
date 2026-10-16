@@ -647,7 +647,11 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 				h2Settings["path"] = v
 			}
 			if v, ok := nc.NetworkSettings["host"]; ok {
-				h2Settings["host"] = []interface{}{v}
+				if host, ok := v.(string); ok {
+					h2Settings["host"] = []string{host}
+				} else {
+					h2Settings["host"] = v
+				}
 			}
 		}
 		ss["httpSettings"] = h2Settings
@@ -677,8 +681,37 @@ func applyStreamSettings(base M, nc *model.NodeSpec, tc kernel.TLSCert) {
 		}
 		ss["xhttpSettings"] = xhttpSettings
 
+	case "kcp", "mkcp":
+		kcpSettings := M{}
+		for _, key := range []string{"mtu", "tti", "uplinkCapacity", "downlinkCapacity", "congestion", "readBufferSize", "writeBufferSize"} {
+			if v, ok := nc.NetworkSettings[key]; ok {
+				kcpSettings[key] = v
+			}
+		}
+		ss["kcpSettings"] = kcpSettings
+
+		// Current Xray moved legacy mKCP headers and encryption to UDP masks.
+		var masks []M
+		if header, ok := nc.NetworkSettings["header"].(map[string]interface{}); ok {
+			if kind, ok := header["type"].(string); ok && kind != "" && kind != "none" {
+				if kind == "wechat-video" {
+					kind = "wechat"
+				}
+				masks = append(masks, M{"type": "header-" + kind})
+			}
+		}
+		if seed, ok := nc.NetworkSettings["seed"].(string); ok && seed != "" {
+			masks = append(masks, M{"type": "mkcp-aes128gcm", "settings": M{"password": seed}})
+		} else {
+			masks = append(masks, M{"type": "mkcp-original"})
+		}
+		// Headers wrap the encrypted packet, so the encryption mask comes last.
+		ss["finalmask"] = M{"udp": masks}
+
 	case "tcp":
-		// default, no extra settings
+		if header, ok := nc.NetworkSettings["header"]; ok {
+			ss["tcpSettings"] = M{"header": header}
+		}
 	}
 
 	// TLS

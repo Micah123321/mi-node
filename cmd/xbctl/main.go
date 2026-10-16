@@ -170,6 +170,8 @@ func run(args []string) error {
 		return runStatus()
 	case "list":
 		return runList(args[1:])
+	case "remove":
+		return runRemove(args[1:])
 	case "instance":
 		return runInstance(args[1:])
 	case "service":
@@ -219,6 +221,7 @@ func printUsage() {
   xbctl help
   xbctl status
   xbctl list [--output text|json]
+  xbctl remove <node-id> [--panel URL]
   xbctl instance list [--output text|json]
   xbctl instance get <id> [--output text|json]
   xbctl config init --mode node|machine --panel-url URL --token TOKEN [cert/egress flags]
@@ -689,19 +692,25 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 		}
 		return fmt.Errorf("binding not found: panel=%s machine_id=%d", panelURL, machineID)
 	}
+	return persistRemovedBindings(root, kept, removed, defaultConfigPath, defaultCredentialsPath, defaultMetaPath, runServiceCommand)
+}
+
+func persistRemovedBindings(root *config.RootConfig, kept, removed []config.Config, configPath, credentialsPath, metaPath string, serviceCommand func(string, ...string) error) error {
 	if len(kept) == 0 {
 		// Last binding removed — stop the service to prevent crash-loop
 		root.Instances = nil
-		if err := writeRootConfig(defaultConfigPath, root); err != nil {
+		// Prevent config and metadata writers from restoring the legacy binding.
+		root.Config.Panel = config.PanelConfig{}
+		if err := writeRootConfig(configPath, root); err != nil {
 			return err
 		}
-		if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+		if err := pruneCredentialKeys(credentialsPath, removed); err != nil {
 			return err
 		}
-		if err := writeInstallMeta(defaultMetaPath, root); err != nil {
+		if err := writeInstallMeta(metaPath, root); err != nil {
 			return err
 		}
-		runServiceCommand("stop")
+		serviceCommand("stop")
 		fmt.Printf("removed %d binding(s)\n", len(removed))
 		fmt.Println("All bindings removed. Service stopped.")
 		fmt.Println("Use 'xbctl bind add-node/add-machine' to add a new binding, or 'xbctl uninstall' to fully uninstall.")
@@ -710,16 +719,16 @@ func removeBinding(panelURL string, nodeID int, machineID int, instanceID string
 
 	root.Instances = kept
 	// Preserve top-level shared settings (log, kernel, etc.) — instances inherit from these.
-	if err := writeRootConfig(defaultConfigPath, root); err != nil {
+	if err := writeRootConfig(configPath, root); err != nil {
 		return err
 	}
-	if err := pruneCredentialKeys(defaultCredentialsPath, removed); err != nil {
+	if err := pruneCredentialKeys(credentialsPath, removed); err != nil {
 		return err
 	}
-	if err := writeInstallMeta(defaultMetaPath, root); err != nil {
+	if err := writeInstallMeta(metaPath, root); err != nil {
 		return err
 	}
-	if err := runServiceCommand("restart"); err != nil {
+	if err := serviceCommand("restart"); err != nil {
 		return err
 	}
 	fmt.Printf("removed %d binding(s)\n", len(removed))

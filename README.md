@@ -198,8 +198,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Micah123321/mi-node/refs/hea
 
 xbctl status
 xbctl list
+xbctl remove 458
 xbctl service logs
 ```
+
+`xbctl remove 458` 按面板节点 ID 删除本机绑定，沿用原有删除流程更新配置和凭据、重启服务；删除最后一个绑定时停止服务。若多个绑定具有相同节点 ID，可用 `xbctl remove 458 --panel http://panel.example.com` 指定面板，或继续使用 `xbctl bind remove <instance-id>` 精确删除。
 
 ### 旧 Xboard-Node 批量迁移到 mi-node
 

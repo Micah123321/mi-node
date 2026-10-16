@@ -4,6 +4,8 @@
 
 ### 新增
 
+- **[xbctl/remove]**: 新增 `xbctl remove 458` 按面板节点 ID 快捷删除本机绑定，支持 `--panel URL` 消歧；解析完整正整数并排除机器、本地独立及旧式多节点聚合配置，匹配唯一节点后按实例 ID 调用原有配置/凭据/元数据更新和服务重启或停止流程。帮助和 README 已同步；CLI 全量测试与帮助命令验证通过，覆盖 ID/实例名称区分、非法参数、模式隔离和重复 ID。未操作远程绑定、未发布。
+
 - **[install/xbctl]**: 原生安装器新增 Alpine/OpenRC 兼容；`install.sh` 会按 init system 渲染 systemd unit 或 OpenRC init 脚本，`xbctl service/status/egress/upgrade/uninstall` 会自动选择 `systemctl` 或 `rc-service`/`rc-update`，避免 Alpine 环境因缺少 systemd 直接失败。 — by yinjianm
   - 方案: [202606052356_alpine-openrc-installer](archive/2026-06/202606052356_alpine-openrc-installer/)
   - 决策: alpine-openrc-installer#D001(使用 init system 抽象覆盖完整服务生命周期)
@@ -13,6 +15,8 @@
   - 决策: node-traffic-limit-enforcement#D001(由 mi-node 本地强制节点下线), node-traffic-limit-enforcement#D002(复用 Xboard `transfer_enable` 作为节点月额度)
 
 ### 快速修改
+
+- **[kernel/xray/transport-templates]**: 配合 Xboard 节点模板补齐 TCP HTTP header/request 与 mKCP seed/header 下发；按当前 Xray UDP finalmask 格式映射旧 mKCP 参数，修正 H2 Host 列表二次包装。新增通过真实 Xray JSON 配置解析器的 TCP/mKCP 回归，覆盖头部、seed 与字符串/数组 Host；保留当前依赖对已移除 H2 的错误，不宣称恢复其传输支持。`go test -tags with_quic ./internal/kernel/xray -count=1 -timeout=90s` 通过，Linux amd64 发布标签构建及压缩包完成；未部署，客户端实际端到端互通待部署验证。
 
 - **[kernel/xray/http-billing]**: 修复原生 HTTP 按认证用户名(UUID)记录计数器、聚合却只查询user@ID导致用户流量始终为0的问题；按协议追踪真实计数器身份并保留至旧实例排空，AddUsers首次更新前先保存计费和身份，避免旧UUID尾流量漏记；HTTP用户名与另一UID规范email同名时按真实用户名归属，其他协议仍使用user@ID。新增普通HTTP转发、双用户CONNECT、重复采样、停止尾流量和用户替换/移除的真实TCP回归，以及身份轮换/碰撞/隔离单元测试。Windows和Linux 0/1/100/500连接实验均通过，最终上传24641/下载49641字节全额一致；保留Linux原生splice下载在连接结束时提交计数的行为。发布标签kernel/service/tracker/cmd回归和Linux Xray竞态通过；普通HTTP补充用例单独通过Windows及Linux竞态。未部署。
 
