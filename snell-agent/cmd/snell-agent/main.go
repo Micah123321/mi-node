@@ -13,12 +13,17 @@ import (
 
 func main() {
 	path := flag.String("config", "config.json", "agent JSON configuration")
+	check := flag.Bool("check-config", false, "validate configuration without starting the agent or touching report state")
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	cfg, err := agent.LoadConfig(*path)
 	if err != nil {
 		logger.Error("configuration failed", "reason", err)
 		os.Exit(1)
+	}
+	if *check {
+		logger.Info("configuration is valid")
+		return
 	}
 	a, err := agent.New(cfg, logger)
 	if err != nil {

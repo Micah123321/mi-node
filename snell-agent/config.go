@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/url"
 	"os"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -61,10 +60,6 @@ func (c *Config) normalize() error {
 	u, err := url.Parse(c.PanelURL)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return errors.New("invalid panel_url")
-	}
-	ip := net.ParseIP(u.Hostname())
-	if u.Scheme == "http" && !strings.EqualFold(u.Hostname(), "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return errors.New("panel_url requires HTTPS outside loopback")
 	}
 	if c.Token == "" || c.NodeID <= 0 {
 		return errors.New("token and positive node_id are required")

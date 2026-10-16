@@ -27,6 +27,9 @@ jobs:
           go mod verify
           go test -race ./...
           go vet ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -o bin/snell-agent-linux-amd64 ./cmd/snell-agent
+          bash -n install.sh
+          sudo python3 tests/install_test.py
   build:
     runs-on: ubuntu-latest
     needs: test
@@ -81,11 +84,13 @@ jobs:
           cp README.md ../dist/README.md
           cp deploy/snell-agent.service ../dist/snell-agent.service
           cp config.example.json ../dist/config.example.json
+          cp install.sh ../dist/install.sh
+          chmod +x ../dist/install.sh
           printf '%s\n' "$GITHUB_SHA" > ../dist/SOURCE_REVISION
           cd ../dist
           chmod +x snell-agent-linux-amd64
           ./snell-agent-linux-amd64 -h
-          sha256sum snell-agent-linux-* OPENSNELL-LICENSE README.md snell-agent.service config.example.json SOURCE_REVISION > SHA256SUMS
+          sha256sum snell-agent-linux-* OPENSNELL-LICENSE README.md snell-agent.service config.example.json install.sh SOURCE_REVISION > SHA256SUMS
       - name: Publish separate Snell prerelease
         env:
           GH_TOKEN: ${{ github.token }}

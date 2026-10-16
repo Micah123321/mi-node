@@ -4,6 +4,44 @@
 
 OpenSnell alpha 固定在 [55c60d02794aaaafde2e47594f125419dba1654d](https://github.com/missuo/opensnell/tree/55c60d02794aaaafde2e47594f125419dba1654d)，Go 模块版本为 `v1.0.4-0.20260529145304-55c60d02794a`。直接使用该提交的 `UserStore.ListUsers`、`ServerConfig.OnAuthorize` 和 `Server.ServeListener`。OpenSnell 依赖采用 GPL-3.0-or-later，分发时一并遵循其许可证。
 
+## 一键安装（Linux / systemd）
+
+在服务器 root 终端执行，无需手动上传文件或安装 Go：
+
+```sh
+bash <(curl -fsSL https://raw.githubusercontent.com/Micah123321/mi-node/refs/heads/dev/snell-agent/install.sh) \
+  -a https://panel.example.com \
+  -t PANEL_SERVER_TOKEN \
+  -n 41
+```
+
+-a 为面板根地址（按传入协议支持 HTTP / HTTPS），-t 为节点通信 Token，-n 为 Snell 节点数字 ID。Snell 使用自身加密，无需 TLS 证书，--cert-* 参数会在安装前给出不适用提示，参数值不写日志。Token 保留引号并按 JSON 转义；也可用 --token-file /root/snell-token.txt 代替 -t。
+
+脚本自动识别 amd64 / arm64，查询 Micah123321/mi-node 的完整 snell-v 预发布版本，下载对应程序及 SHA256SUMS，固定同一 tag 并完成校验，再安装独立用户和 systemd 服务。普通 mi-node Release 和缺少对应程序或校验文件的 Snell Release 会跳过。默认最多检查 500 条 Release；可通过 --version 固定 tag、--release-repo OWNER/REPO 更换来源。GitHub /releases/latest 不用于 Snell，避免取到普通节点程序。
+
+首次可交互输入；升级可重新执行同一条 -a/-t/-n 命令，相同参数保留配置原文和计费队列。任何已提供的身份参数与现有配置不一致时，脚本保留原安装并报错，避免把队列切换到另一节点。
+
+自动安装依赖支持 apt-get / dnf / yum，只在缺少 Python 3、curl 或 flock 时安装。目标系统需要 systemd；脚本无需本地仓库或 Go。端口来自面板，放行相应 TCP 端口并使用 1024 及以上端口。
+
+本地包、指定程序和源码构建同样保留：
+
+```sh
+sudo bash install.sh -a https://panel.example.com -t PANEL_SERVER_TOKEN -n 41
+sudo bash install.sh --config /root/snell-config.json --binary ./bin/snell-agent-linux-amd64
+sudo bash install.sh --build
+```
+
+本地脚本旁有预编译程序时优先使用；明确 --version 时使用远程版本。--config 仅用于首次导入完整配置，且 state_dir 应为 /var/lib/snell-agent。--no-start / --skip-start 只安装和启用开机自启，当前服务保持停止。自定义下载支持 --binary-url HTTPS_URL --sha256 SHA256。
+
+安装到 /usr/local/bin/snell-agent，配置为 /etc/snell-agent/config.json（专用用户所有、0600），服务为 snell-agent.service。安装器先以 -check-config 验证配置，该模式不创建状态目录、不访问面板。停止旧进程前完成来源及配置校验，再原子替换文件。旧文件保存在 /var/backups/snell-agent/时间戳-进程号/；启动失败会恢复旧文件和之前的服务状态，报告目录保持原样。
+
+```sh
+systemctl status snell-agent --no-pager
+journalctl -u snell-agent -f
+```
+
+GitHub 上的远程入口和程序由 .github/workflows/snell-agent-release.yml 发布；本地修改推送到 dev 并完成该流程后，新版一键命令才会生效。
+
 ## 构建与运行
 
 需要 Go 1.24.7 或更高版本。在本目录执行，始终使用本模块的依赖：
@@ -30,7 +68,7 @@ go build -trimpath -o bin/snell-agent-linux-amd64 ./cmd/snell-agent
 
 | 配置 | 含义 |
 | --- | --- |
-| `panel_url` | 面板根 URL，可包含子目录；远端面板使用 HTTPS，HTTP 仅接受 localhost 或回环 IP；禁止 URL 用户信息、query 和 fragment。 |
+| `panel_url` | 面板根 URL，可包含子目录，支持显式 HTTP / HTTPS；禁止 URL 用户信息、query 和 fragment。 |
 | `token` / `node_id` | 每次请求的 query 认证；node_id 为正整数。 |
 | `pull_interval` | 字符串时长，例如 `30s`；省略或 `0s` 时使用面板 pull_interval，否则覆盖面板值。 |
 | `report_interval` | 字符串时长；省略或 `0s` 时使用面板 push_interval，否则覆盖面板值。 |
@@ -124,9 +162,18 @@ sudo systemctl enable --now snell-agent
 sudo journalctl -u snell-agent -f
 ```
 
-服务示例的 state_dir 应为 `/var/lib/snell-agent`。部署命令为人工执行示例，本次实现没有安装服务或连接真实面板。
+服务示例的 state_dir 应为 `/var/lib/snell-agent`。上述命令为手工安装方式，也可使用 install.sh 完成相同步骤。安装脚本的验收只在临时 chroot 中运行，未在真实服务器安装服务或连接线上面板。
 
 ## 验证
+
+安装器 50 项回归已通过，覆盖短参数、HTTP 面板、特殊字符 Token、流式脚本入口、Snell Release 筛选与分页、固定 tag、自动 SHA256 校验、交互式隐藏输入、重复升级、文件权限、锁竞争以及服务失败回滚。测试使用真实 Linux Agent 执行配置预检，文件安装在临时 chroot 中，systemctl 和 HTTPS 传输由测试夹具替代。Linux 上以 root 运行；只影响临时目录：
+
+```sh
+sudo python3 tests/install_test.py
+bash -n install.sh
+```
+
+Agent 验证：
 
 ```sh
 GOWORK=off go test ./...
