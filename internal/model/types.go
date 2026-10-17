@@ -96,10 +96,38 @@ type TrafficLimitSpec struct {
 }
 
 type UserSpec struct {
-	ID          int
-	UUID        string
-	SpeedLimit  int
-	DeviceLimit int
+	BillingUserID int
+	BillingNodeID int
+	ID            int
+	UUID          string
+	SpeedLimit    int
+	DeviceLimit   int
+}
+
+// AccountID is only for account-wide limits and online state; ID remains the auth identity.
+func (u UserSpec) AccountID() int {
+	if u.BillingUserID > 0 {
+		return u.BillingUserID
+	}
+	return u.ID
+}
+
+// AccountLimits chooses the strictest positive limit if aliases disagree.
+func AccountLimits(users []UserSpec) map[int]UserSpec {
+	accounts := make(map[int]UserSpec, len(users))
+	for _, u := range users {
+		id := u.AccountID()
+		a := accounts[id]
+		a.ID = id
+		if u.SpeedLimit > 0 && (a.SpeedLimit <= 0 || u.SpeedLimit < a.SpeedLimit) {
+			a.SpeedLimit = u.SpeedLimit
+		}
+		if u.DeviceLimit > 0 && (a.DeviceLimit <= 0 || u.DeviceLimit < a.DeviceLimit) {
+			a.DeviceLimit = u.DeviceLimit
+		}
+		accounts[id] = a
+	}
+	return accounts
 }
 
 func (n *NodeSpec) GetProxyProtocol() bool {

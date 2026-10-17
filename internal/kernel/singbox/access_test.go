@@ -246,6 +246,27 @@ type accessConcurrentConn struct{ net.Conn }
 
 func (*accessConcurrentConn) Write(b []byte) (int, error) { return len(b), nil }
 func (*accessConcurrentConn) Close() error                { return nil }
+func TestAccessTargetIgnoresQUICListenerAndPreservesOriginalRequest(t *testing.T) {
+	for _, port := range []uint16{0, 30443} {
+		m := accessMetadata()
+		m.OriginDestination = singM.Socksaddr{Addr: netip.MustParseAddr("127.0.0.1"), Port: port}
+		if got := accessTarget(m, "tcp"); got.Domain != "Video.Example." || got.Port != 443 {
+			t.Fatalf("listener replaced request: %+v", got)
+		}
+		m.RouteOriginalDestination = m.Destination
+		m.Destination = singM.Socksaddr{Addr: netip.MustParseAddr("192.0.2.5"), Port: 8443}
+		if got := accessTarget(m, "tcp"); got.Domain != "Video.Example." || got.Port != 443 {
+			t.Fatalf("route override replaced original request: %+v", got)
+		}
+	}
+	m := accessMetadata()
+	m.FakeIP = true
+	m.OriginDestination = singM.Socksaddr{Addr: netip.MustParseAddr("198.18.0.1"), Port: 443}
+	if got := accessTarget(m, "tcp"); got.IP != "198.18.0.1" || got.Port != 443 || got.Domain != "" {
+		t.Fatalf("fake-IP original destination was lost: %+v", got)
+	}
+}
+
 func TestAccessConcurrentDrainAndClose(t *testing.T) {
 	ct := accessTracker()
 	conn := ct.RoutedConnection(context.Background(), &accessConcurrentConn{}, accessMetadata(), nil, nil)

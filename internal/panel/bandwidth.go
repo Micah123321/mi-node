@@ -104,6 +104,7 @@ func (c *BandwidthClient) request(ctx context.Context, method, operation string,
 	if err != nil {
 		return errors.New("bandwidth: invalid request")
 	}
+	setCapabilityHeader(req.Header)
 	// Never replay a raw upload automatically after a connection failure.
 	req.GetBody = nil
 	req.Header.Set("Accept", "application/json")

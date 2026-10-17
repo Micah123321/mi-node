@@ -838,6 +838,7 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	inst := x.instance
 	fn := x.speedLimitFunc
 	currentUsers := x.users
+	proto := x.protocol
 	x.mu.Unlock()
 	if inst == nil {
 		return
@@ -856,6 +857,9 @@ func (x *Xray) updateBandwidthLimits(users []model.UserSpec) {
 	}
 	for _, u := range users {
 		email := userEmail(u.ID)
+		if proto == "http" {
+			email = u.UUID
+		}
 		if fn != nil {
 			bm.SetUserLimiter(email, fn(u.UUID))
 			continue
@@ -881,19 +885,23 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 
 func configureDispatcherLimits(ld *LimitDispatcher, users []model.UserSpec) {
 	emailToUID := make(map[string]int, len(users)*2)
+	billing := make(map[string]int, len(users)*2)
+	accounts := model.AccountLimits(users)
 	deviceLimits := make(map[string]int)
 
 	for _, u := range users {
 		email := userEmail(u.ID)
 		emailToUID[email] = u.ID
 		emailToUID[u.UUID] = u.ID
-		if u.DeviceLimit > 0 {
-			deviceLimits[email] = u.DeviceLimit
-			deviceLimits[u.UUID] = u.DeviceLimit
+		billing[email] = u.AccountID()
+		billing[u.UUID] = u.AccountID()
+		if limit := accounts[u.AccountID()].DeviceLimit; limit > 0 {
+			deviceLimits[email] = limit
+			deviceLimits[u.UUID] = limit
 		}
 	}
 
-	ld.UpdateLimits(emailToUID, deviceLimits, nil)
+	ld.UpdateLimits(emailToUID, deviceLimits, nil, billing)
 }
 
 // xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture

@@ -63,11 +63,13 @@ func (c *packetAccessUpstream) WritePacket(buffer *buf.Buffer, dest singM.Socksa
 
 func accessTarget(m adapter.InboundContext, network string) access.Target {
 	dest := m.Destination
-	// OriginDestination retains the client's request before route overrides.
+	// RouteOriginalDestination retains the request before route overrides.
 	if m.RouteOriginalDestination.IsValid() {
 		dest = m.RouteOriginalDestination
 	}
-	if m.OriginDestination.IsValid() {
+	// QUIC inbounds also put their listener address here; only fake-IP
+	// translation makes OriginDestination a client-requested endpoint.
+	if m.FakeIP && m.OriginDestination.IsValid() {
 		dest = m.OriginDestination
 	}
 	t := packetAccessTarget(dest)

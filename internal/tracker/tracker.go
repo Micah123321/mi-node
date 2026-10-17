@@ -2,6 +2,7 @@ package tracker
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"sort"
 	"sync"
@@ -225,9 +226,12 @@ func calcAliveIPsHash(aliveIPs map[int]map[string]bool) string {
 		sort.Strings(ipList)
 
 		// Write user ID and IPs to hash
-		h.Write([]byte{byte(uid >> 24), byte(uid >> 16), byte(uid >> 8), byte(uid)})
+		var id [8]byte
+		binary.LittleEndian.PutUint64(id[:], uint64(uid))
+		h.Write(id[:])
 		for _, ip := range ipList {
 			h.Write([]byte(ip))
+			h.Write([]byte{0})
 		}
 	}
 

@@ -272,10 +272,12 @@ type RouteAction struct {
 
 // User represents a user returned by the panel
 type User struct {
-	ID          int    `json:"id"`
-	UUID        string `json:"uuid"`
-	SpeedLimit  int    `json:"speed_limit"`  // Mbps, 0 = unlimited
-	DeviceLimit int    `json:"device_limit"` // max devices, 0 = unlimited
+	BillingUserID int    `json:"billing_user_id,omitempty"`
+	BillingNodeID int    `json:"billing_node_id,omitempty"`
+	ID            int    `json:"id"`
+	UUID          string `json:"uuid"`
+	SpeedLimit    int    `json:"speed_limit"`  // Mbps, 0 = unlimited
+	DeviceLimit   int    `json:"device_limit"` // max devices, 0 = unlimited
 }
 
 type UsersResponse struct {

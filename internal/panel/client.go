@@ -512,6 +512,7 @@ func (c *Client) doRequestContext(ctx context.Context, method, path string, body
 		return nil, err
 	}
 
+	setCapabilityHeader(req.Header)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
 	if ifNoneMatch != "" {
@@ -534,6 +535,13 @@ func (c *Client) doRequestContext(ctx context.Context, method, path string, body
 
 	nlog.Core().Debug("panel response", "method", method, "path", path, "status", resp.StatusCode)
 	return resp, nil
+}
+
+// setCapabilityHeader advertises child identities only on runtimes with 64-bit ints.
+func setCapabilityHeader(header http.Header) {
+	if strconv.IntSize == 64 {
+		header.Set("X-Mi-Node-Child-Rate", "1")
+	}
 }
 
 // drainAndClose reads any remaining bytes (up to 512B) and closes the body.

@@ -1178,6 +1178,7 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		if deltaUsers == nil || len(deltaUsers) == 0 {
 			return
 		}
+		deltaUsers = expandAccountUsers(s.lastUsers, deltaUsers)
 		filtered := subtractUsers(s.lastUsers, deltaUsers)
 
 		if s.runBlocked() {
@@ -1230,6 +1231,21 @@ func mergeUsers(base, delta []model.UserSpec) []model.UserSpec {
 	out := make([]model.UserSpec, 0, len(m))
 	for _, u := range m {
 		out = append(out, u)
+	}
+	return out
+}
+
+// expandAccountUsers keeps auth-ID removals precise and expands real account removals.
+func expandAccountUsers(base, delta []model.UserSpec) []model.UserSpec {
+	ids := make(map[int]bool, len(delta))
+	for _, u := range delta {
+		ids[u.ID] = true
+	}
+	out := append([]model.UserSpec(nil), delta...)
+	for _, u := range base {
+		if ids[u.AccountID()] && !ids[u.ID] {
+			out = append(out, u)
+		}
 	}
 	return out
 }
@@ -1495,7 +1511,7 @@ func (s *Service) buildMetrics(status monitor.Status) map[string]interface{} {
 	m["active_connections"] = s.tracker.ActiveConnections()
 	m["total_connections"] = s.tracker.TotalConnections()
 	m["active_users"] = len(online)
-	m["total_users"] = len(lastUsers)
+	m["total_users"] = len(model.AccountLimits(lastUsers))
 
 	// Speed
 	m["inbound_speed"] = s.tracker.InboundSpeed()
@@ -1573,6 +1589,10 @@ func computeUserHash(users []model.UserSpec) string {
 		binary.LittleEndian.PutUint64(buf[:], uint64(u.SpeedLimit))
 		h.Write(buf[:])
 		binary.LittleEndian.PutUint64(buf[:], uint64(u.DeviceLimit))
+		h.Write(buf[:])
+		binary.LittleEndian.PutUint64(buf[:], uint64(u.BillingUserID))
+		h.Write(buf[:])
+		binary.LittleEndian.PutUint64(buf[:], uint64(u.BillingNodeID))
 		h.Write(buf[:])
 	}
 	return fmt.Sprintf("%x", h.Sum(nil))

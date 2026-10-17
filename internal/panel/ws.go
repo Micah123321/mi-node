@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"strconv"
 	"sync/atomic"
@@ -219,7 +220,9 @@ func (w *WSClient) connect(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: w.cfg.HandshakeTimeout,
 	}
-	conn, _, err := dialer.DialContext(ctx, u.String(), nil)
+	header := make(http.Header)
+	setCapabilityHeader(header)
+	conn, _, err := dialer.DialContext(ctx, u.String(), header)
 	if err != nil {
 		return fmt.Errorf("dial: %w", err)
 	}

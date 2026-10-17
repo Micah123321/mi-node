@@ -77,10 +77,12 @@ type LimitDispatcher struct {
 
 	// limitedUsers: users with device limit > 0, protected by mu.
 	// Needs deterministic IP ordering for kick decisions.
-	mu           sync.RWMutex
-	limitedIPs   map[string]map[string]int // email → sourceIP → refcount
-	deviceLimits map[string]int            // email → max devices
-	emailToUID   map[string]int            // email → panel user ID
+	mu             sync.RWMutex
+	limitedIPs     map[string]map[string]int // email → sourceIP → refcount
+	deviceLimits   map[string]int            // email → max devices
+	emailToAccount map[string]int
+	accountIDs     map[string]int
+	emailToUID     map[string]int // email → panel user ID
 
 	// unlimitedIPs: per-user containers; membership changes under their own lock.
 	// Each entry is *ipCounter{ips sync.Map}.
@@ -224,12 +226,37 @@ func (d *LimitDispatcher) Close() error {
 
 // ─── Limit management (called by Xray kernel) ──────────────────────────────
 
-func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int) {
+func (d *LimitDispatcher) UpdateLimits(emailToUID map[string]int, deviceLimits, _ map[string]int, billing ...map[string]int) {
 	d.mu.Lock()
-	d.emailToUID = emailToUID
-	d.deviceLimits = deviceLimits
-	d.mu.Unlock()
-
+	defer d.mu.Unlock()
+	if d.emailToUID == nil {
+		d.emailToUID = make(map[string]int)
+	}
+	if d.emailToAccount == nil {
+		d.emailToAccount = make(map[string]int)
+	}
+	if d.accountIDs == nil {
+		d.accountIDs = make(map[string]int)
+	}
+	limits := make(map[string]int, len(deviceLimits))
+	for email, limit := range deviceLimits {
+		limits[email] = limit
+	}
+	for email, uid := range emailToUID {
+		// Retain identity metadata for streams admitted before user removal.
+		d.emailToUID[email] = uid
+		key, accountID := email, uid
+		if len(billing) > 0 && billing[0][email] > 0 {
+			accountID = billing[0][email]
+			d.emailToAccount[email] = accountID
+			key = userEmail(accountID)
+		}
+		d.accountIDs[key] = accountID
+		if limit := deviceLimits[email]; limit > 0 && (limits[key] == 0 || limit < limits[key]) {
+			limits[key] = limit
+		}
+	}
+	d.deviceLimits = limits
 }
 
 func (d *LimitDispatcher) ResetConns() {
@@ -246,7 +273,7 @@ func (d *LimitDispatcher) ResetConns() {
 func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool, connCount int) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	emailToUID := d.emailToUID
+	emailToUID := d.accountIDs
 	limitedIPs := d.limitedIPs
 
 	aliveIPs = make(map[int]map[string]bool)
@@ -295,6 +322,11 @@ func (d *LimitDispatcher) GetConnectionState() (aliveIPs map[int]map[string]bool
 
 // checkDeviceLimit returns a lease for the actual admission container.
 func (d *LimitDispatcher) checkDeviceLimit(email, sourceIP string, isTCP bool) (*connectionLease, bool) {
+	d.mu.RLock()
+	if id := d.emailToAccount[email]; id > 0 {
+		email = userEmail(id)
+	}
+	d.mu.RUnlock()
 	for {
 		d.mu.RLock()
 		limit := d.deviceLimits[email]

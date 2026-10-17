@@ -136,7 +136,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 		s.connTracker.SetDisableDeviceGate(s.cfg.LowJitterDisableDeviceGate)
 	}
 	combined := append(append([]model.UserSpec(nil), s.users...), users...)
-	s.connTracker.SetUserMap(buildUserMap(combined))
+	s.connTracker.SetUserMap(buildUserMap(combined), buildAccountMap(combined))
 	if s.speedLimitFunc != nil {
 		s.connTracker.SetSpeedLimitFunc(s.speedLimitFunc)
 	}
@@ -147,12 +147,12 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	if router == nil {
 		_ = instance.Close()
 		cancel()
-		s.connTracker.SetUserMap(buildUserMap(s.users))
+		s.connTracker.SetUserMap(buildUserMap(s.users), buildAccountMap(s.users))
 		return fmt.Errorf("traffic tracker: router not available")
 	}
 	router.AppendTracker(s.connTracker)
 	if err := instance.Start(); err != nil {
-		s.connTracker.SetUserMap(buildUserMap(s.users))
+		s.connTracker.SetUserMap(buildUserMap(s.users), buildAccountMap(s.users))
 		instance.Close()
 		cancel()
 		return fmt.Errorf("start sing-box: %w", err)
@@ -167,7 +167,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.tls = tls
 
 	s.trackerRegistered = true
-	s.connTracker.SetUserMap(buildUserMap(users))
+	s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
 
 	// Recycle old instance in background — drain then close.
 	if oldBox != nil {
@@ -329,7 +329,7 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	// Trackers remain registered on the Router (which survives ReloadUsers).
 	// Only update the user map — do NOT re-register or traffic is double-counted.
 	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
+		s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
 	}
 
 	nlog.Core().Debug("sing-box reloaded", "users", len(users))
@@ -461,26 +461,31 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 		return 0, fmt.Errorf("not running")
 	}
 
-	existing := make(map[int]struct{}, len(s.users))
-	for _, u := range s.users {
-		existing[u.ID] = struct{}{}
+	merged := append([]model.UserSpec(nil), s.users...)
+	positions := make(map[int]int, len(merged))
+	for i, u := range merged {
+		positions[u.ID] = i
 	}
-	var toAdd []model.UserSpec
+	added := 0
 	for _, u := range users {
-		if _, dup := existing[u.ID]; !dup {
-			toAdd = append(toAdd, u)
+		if i, ok := positions[u.ID]; ok {
+			merged[i] = u
+		} else {
+			positions[u.ID] = len(merged)
+			merged = append(merged, u)
+			added++
 		}
 	}
-	if len(toAdd) == 0 {
-		return 0, nil
-	}
-
-	merged := append(append([]model.UserSpec{}, s.users...), toAdd...)
-	if err := s.reloadInboundsLocked(merged); err != nil {
-		return 0, err
+	toAdd, toRemove := kernel.UserDiff(s.users, merged)
+	if len(toAdd) > 0 || len(toRemove) > 0 {
+		if err := s.reloadInboundsLocked(merged); err != nil {
+			return 0, err
+		}
+	} else if s.connTracker != nil {
+		s.connTracker.SetUserMap(buildUserMap(merged), buildAccountMap(merged))
 	}
 	s.users = merged
-	return len(toAdd), nil
+	return added, nil
 }
 
 // RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
@@ -532,7 +537,7 @@ func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err e
 	if added == 0 && removed == 0 {
 		// Only limits may have changed — update tracker map.
 		if s.connTracker != nil {
-			s.connTracker.SetUserMap(buildUserMap(users))
+			s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
 		}
 		s.users = users
 		return 0, 0, nil
@@ -636,7 +641,7 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	}
 
 	if s.connTracker != nil {
-		s.connTracker.SetUserMap(buildUserMap(users))
+		s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
 	}
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
@@ -675,9 +680,16 @@ func (s *SingBox) CloseUserConnections(_ context.Context, uuid string) error {
 	return nil
 }
 
-// buildUserMap creates a UUID→userID mapping used by ConnTracker to attribute
-// connections to the correct user. All sing-box protocols use the user's UUID
-// as the inbound name/username, so this covers every protocol.
+// buildAccountMap separates admission accounts from authentication IDs.
+func buildAccountMap(users []model.UserSpec) map[int]int {
+	m := make(map[int]int, len(users))
+	for _, u := range users {
+		m[u.ID] = u.AccountID()
+	}
+	return m
+}
+
+// buildUserMap indexes UUIDs; ConnTracker also resolves numeric Naive usernames.
 func buildUserMap(users []model.UserSpec) map[string]int {
 	m := make(map[string]int, len(users))
 	for _, u := range users {

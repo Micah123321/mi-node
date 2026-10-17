@@ -1,5 +1,35 @@
 # Traffic report reliability
 
+## Child authentication identities
+
+64-bit nodes advertise `X-Mi-Node-Child-Rate: 1` on panel HTTP requests,
+including bandwidth requests and WebSocket handshakes. 32-bit nodes do not
+advertise this capability. Existing accounts retain their original ID and UUID.
+The panel may additionally send `{id: 1099511627776 + DB_identity_id, uuid,
+speed_limit, device_limit, billing_user_id, billing_node_id}`; IDs must remain
+below 2^53 and require a 64-bit runtime. This is an allocated ID range, not a
+bit encoding of an account or node.
+
+Traffic keys and access entry user IDs remain authentication IDs, including
+bytes written after user deletion or UUID rotation. The panel resolves the
+identity to its billing account and child node. No child traffic payload,
+report field, multiplier, or spool format is added.
+
+`billing_user_id` (falling back to the authentication ID) groups token buckets,
+device admission, alive IPs, online counts, device reports and user metrics.
+IP sets are merged per account. If alias limits disagree, the strictest positive
+speed/device limit wins; zero means unlimited only when no alias sets a limit.
+Device sync from the panel uses real account IDs. `billing_node_id` is preserved
+as metadata and participates in user change detection.
+
+A remove delta naming a real account expands to its authentication aliases;
+a delta naming a child authentication ID removes only that identity. Sing-box
+can close tracked TCP connections for a parent UUID across its account aliases.
+UDP force-close and Xray connection termination retain their existing kernel
+limitations; Xray device admission retains its existing TCP-only IP tracking.
+
+## Delivery and recovery
+
 The node sends an optional top-level `report_id` string to
 `POST /api/v2/server/report`. Each batch gets a random 128-bit ID. Retries
 retain the original ID and payload, while newly sampled bytes remain pending

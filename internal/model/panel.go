@@ -158,7 +158,7 @@ func UserSpecsFromPanel(users []panel.User) []UserSpec {
 	}
 	out := make([]UserSpec, 0, len(users))
 	for _, user := range users {
-		out = append(out, UserSpec{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit})
+		out = append(out, UserSpec{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit, BillingUserID: user.BillingUserID, BillingNodeID: user.BillingNodeID})
 	}
 	return out
 }
@@ -315,7 +315,7 @@ func UserSpecsToPanel(users []UserSpec) []panel.User {
 	}
 	out := make([]panel.User, 0, len(users))
 	for _, user := range users {
-		out = append(out, panel.User{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit})
+		out = append(out, panel.User{ID: user.ID, UUID: user.UUID, SpeedLimit: user.SpeedLimit, DeviceLimit: user.DeviceLimit, BillingUserID: user.BillingUserID, BillingNodeID: user.BillingNodeID})
 	}
 	return out
 }
