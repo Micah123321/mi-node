@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/micah123321/mi-node/internal/access"
 	"github.com/micah123321/mi-node/internal/config"
 	"github.com/micah123321/mi-node/internal/kernel"
 	"github.com/micah123321/mi-node/internal/model"
@@ -255,6 +256,36 @@ func TestHTTPConnectTrafficBillingAndStopTail(t *testing.T) {
 	want = map[int][2]int64{101: {1480, 3018}, 202: {4142, 1064}}
 	requireHTTPTraffic(t, x, want)
 	requireHTTPTraffic(t, x, want)
+}
+
+func TestHTTPConnectTrafficBillingWithBandwidthLimit(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		t.Run(fmt.Sprintf("access=%v", enabled), func(t *testing.T) {
+			x, node, target, users := newHTTPTrafficKernel(t)
+			users[0].SpeedLimit = 8
+			x.updateBandwidthLimits(users)
+			x.ConfigureAccess(access.Config{Enabled: enabled})
+			tunnel := openHTTPTrafficTunnel(t, node, target, users[0])
+			tunnel.exchange(t, 1379, 2711)
+			want := map[int][2]int64{users[0].ID: {1379, 2711}}
+			// Limited streams must publish both directions while the tunnel is still open.
+			requireHTTPTraffic(t, x, want)
+			tunnel.exchange(t, 101, 307)
+			tunnel.close()
+			waitHTTPTrafficIdle(t, x)
+			x.Stop()
+			want[users[0].ID] = [2]int64{1480, 3018}
+			requireHTTPTraffic(t, x, want)
+			requireHTTPTraffic(t, x, want)
+			up, down := accessTotals(x.DrainAccess())
+			if enabled && (up != 1480 || down != 3018) {
+				t.Fatalf("limited HTTP access traffic=(%d, %d), want (1480, 3018)", up, down)
+			}
+			if !enabled && (up != 0 || down != 0) {
+				t.Fatalf("disabled HTTP access traffic=(%d, %d)", up, down)
+			}
+		})
+	}
 }
 
 func TestHTTPConnectTrafficSurvivesUserReplacement(t *testing.T) {

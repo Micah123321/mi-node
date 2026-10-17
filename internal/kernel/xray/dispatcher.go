@@ -14,6 +14,8 @@ import (
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/net"
 	"github.com/xtls/xray-core/common/session"
+	"github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/routing"
 	"github.com/xtls/xray-core/transport"
 
@@ -176,6 +178,13 @@ func (d *LimitDispatcher) identifyAndCheck(ctx context.Context, dest net.Destina
 		return "", nil, nil
 	}
 	email = si.User.Email
+	if inst := core.FromContext(ctx); inst != nil {
+		if bm, ok := inst.GetFeature(bandwidth.ManagerType()).(bandwidth.Manager); ok && bm.GetUserLimiter(email) != nil {
+			// Raw splice bypasses RateLimitWriter and cannot see its nested stats counter.
+			// Keep limited streams on the native buffered path for both limits and billing.
+			si.CanSpliceCopy = 3
+		}
+	}
 	if d.disableDeviceGate {
 		d.mu.RLock()
 		lease = &connectionLease{epoch: d.connEpoch}
