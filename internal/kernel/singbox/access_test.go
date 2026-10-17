@@ -184,6 +184,25 @@ func TestAccessUDPActualOptimizedCopy(t *testing.T) {
 	trackedSink.Close()
 }
 
+func TestAccessResolutionUsesOnlyOneAddressForOriginalHost(t *testing.T) {
+	m := accessMetadata()
+	m.OriginDestination = singM.Socksaddr{Addr: netip.IPv6Unspecified(), Port: 30525}
+	m.DestinationAddresses = []netip.Addr{netip.MustParseAddr("192.0.2.5")}
+	got := accessTarget(m, "tcp").Normalize()
+	if got.Domain != "video.example" || got.IP != "192.0.2.5" || got.Port != 443 {
+		t.Fatalf("resolution/listener mixed up: %+v", got)
+	}
+	m.DestinationAddresses = append(m.DestinationAddresses, netip.MustParseAddr("192.0.2.6"))
+	if got := accessTarget(m, "tcp").Normalize(); got.IP != "" {
+		t.Fatalf("ambiguous DNS candidate: %+v", got)
+	}
+	m.RouteOriginalDestination = singM.Socksaddr{Fqdn: "original.example", Port: 443}
+	m.DestinationAddresses = m.DestinationAddresses[:1]
+	if got := accessTarget(m, "tcp").Normalize(); got.Domain != "original.example" || got.IP != "" {
+		t.Fatalf("override IP attributed to request: %+v", got)
+	}
+}
+
 func TestAccessTargetUsesOnlyProvenSniffMetadata(t *testing.T) {
 	m := accessMetadata()
 	m.Destination = singM.Socksaddr{Addr: netip.MustParseAddr("192.0.2.1"), Port: 443}

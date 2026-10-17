@@ -81,7 +81,7 @@ func (t Target) Normalize() Target {
 		}
 	}
 	if t.IP != "" {
-		if ip, err := netip.ParseAddr(t.IP); err == nil {
+		if ip, err := netip.ParseAddr(t.IP); err == nil && !ip.Unmap().IsUnspecified() {
 			t.IP = ip.Unmap().String()
 		} else {
 			t.IP = ""

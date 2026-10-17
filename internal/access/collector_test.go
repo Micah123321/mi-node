@@ -20,6 +20,25 @@ func entryTotals(s Snapshot) (u, d, connections int64) {
 	return
 }
 
+func TestUnspecifiedTargetsPreserveBytesWithoutInventingDestinations(t *testing.T) {
+	for _, ip := range []string{"::", "0.0.0.0", "::ffff:0.0.0.0"} {
+		c := NewCollector(Config{Enabled: true})
+		f := c.NewFlow(123, Target{IP: ip, Port: 30525, Network: "tcp", DomainSource: "ip"})
+		f.Add(3, 5)
+		s := c.Drain()
+		if len(s.Entries) != 1 || s.Entries[0].IP != "" || s.Entries[0].Port != 0 || s.Entries[0].DomainSource != "unknown" {
+			t.Fatalf("placeholder treated as destination: %+v", s)
+		}
+		if u, d, _ := entryTotals(s); u != 3 || d != 5 {
+			t.Fatalf("accounting changed: %d/%d", u, d)
+		}
+		target := (Target{Domain: "example.com", IP: ip, Port: 443, Network: "tcp", DomainSource: "request"}).Normalize()
+		if target.Domain != "example.com" || target.IP != "" || target.Port != 443 || target.DomainSource != "request" {
+			t.Fatalf("request domain lost: %+v", target)
+		}
+	}
+}
+
 func TestCollectorSlicesLiveFlowAndKeepsDisabledTail(t *testing.T) {
 	c := NewCollector(Config{BucketSeconds: 300, MaxEntries: 2})
 	at := int64(901)

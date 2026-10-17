@@ -74,6 +74,14 @@ func accessTarget(m adapter.InboundContext, network string) access.Target {
 	}
 	t := packetAccessTarget(dest)
 	t.Network = network
+	// Resolution belongs to the current route host. Keep only an unambiguous
+	// address, never an override's address or an arbitrary DNS candidate.
+	if t.Domain != "" && t.IP == "" && dest.Fqdn == m.Destination.Fqdn && len(m.DestinationAddresses) == 1 {
+		ip := m.DestinationAddresses[0].Unmap()
+		if ip.IsValid() && !ip.IsUnspecified() {
+			t.IP = ip.String()
+		}
+	}
 	// Domain alone can come from the core's reverse DNS cache. These
 	// successful sniffers explicitly overwrite it with Host/SNI metadata.
 	if m.SniffError == nil && m.Domain != "" && (m.Protocol == "http" || m.Protocol == "tls" || m.Protocol == "quic") {
