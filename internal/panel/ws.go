@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -432,7 +433,7 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	case WSEventSyncDevices:
 		nlog.Core().Debug("ws sync devices event received")
 		var p syncDevicesPayload
-		if err := decodeData(msg.Data, &p); err != nil {
+		if err := decodeDevicePayload(msg.Data, &p); err != nil {
 			nlog.Core().Warn("ws: cannot decode devices payload", "error", err)
 			return
 		}
@@ -463,6 +464,40 @@ func (w *WSClient) handleDataEvent(msg wsMessage) {
 	}
 
 	w.onEvent(event)
+}
+
+// Older panels encode PHP array_unique results with sparse numeric indexes
+// as objects. Normalize only those IP lists; unrelated object shapes stay invalid.
+func decodeDevicePayload(data []byte, target *syncDevicesPayload) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	users, _ := raw["users"].(map[string]interface{})
+	for userID, value := range users {
+		sparse, ok := value.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		indexes := make([]int, 0, len(sparse))
+		for key, value := range sparse {
+			index, err := strconv.Atoi(key)
+			if err != nil || index < 0 || strconv.Itoa(index) != key {
+				return fmt.Errorf("invalid device list index for user %s", userID)
+			}
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("invalid device list value for user %s", userID)
+			}
+			indexes = append(indexes, index)
+		}
+		sort.Ints(indexes)
+		ips := make([]string, 0, len(indexes))
+		for _, index := range indexes {
+			ips = append(ips, sparse[strconv.Itoa(index)].(string))
+		}
+		users[userID] = ips
+	}
+	return decodeWeakRaw(raw, target)
 }
 
 // SendDeviceReport sends local device snapshot to panel via WS.

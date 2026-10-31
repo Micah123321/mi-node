@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
+	mieruCommon "github.com/enfein/mieru/v3/pkg/common"
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
@@ -30,9 +32,8 @@ const drainTimeout = 5 * time.Second
 
 // SingBox implements kernel.Kernel by embedding sing-box as a Go library.
 //
-// User operations (AddUsers/RemoveUsers/UpdateUsers) use sing-box's native
-// UpdatableInbound interface, which hot-swaps user credentials without
-// restarting listeners — zero connection disruption.
+// User operations prefer sing-box's native UpdatableInbound interface.
+// Inbounds without that interface are recreated so credentials take effect.
 type SingBox struct {
 	cfg config.KernelConfig
 
@@ -318,8 +319,11 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		// Remove the existing inbound first so im.Create() can bind the same port.
 		// im.Create() cannot atomically swap a TCP listener — it tries to start the
 		// new socket before the old one is closed, causing "address already in use".
-		// The brief listen gap (< 1 ms) is far less disruptive than a full restart.
+		// Mieru UDP may finish closing its socket on a separate goroutine.
 		_ = im.Remove(tag) // ignore error when tag doesn't exist yet
+		if err := waitForMieruUDPRelease(s.ctx, inb); err != nil {
+			return err
+		}
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
 		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
 			return fmt.Errorf("recreate inbound %s: %w", tag, err)
@@ -450,9 +454,9 @@ func (s *SingBox) ClearGlobalDevices() {
 	}
 }
 
-// ─── User management (non-disruptive) ───────────────────────────────────────
+// ─── User management ─────────────────────────────────────────────────────
 
-// AddUsers hot-swaps users into running inbounds. Zero connection disruption.
+// AddUsers updates running inbounds, recreating those without native user updates.
 func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -488,8 +492,7 @@ func (s *SingBox) AddUsers(users []model.UserSpec) (int, error) {
 	return added, nil
 }
 
-// RemoveUsers hot-swaps users out of running inbounds. Zero connection disruption
-// for remaining users.
+// RemoveUsers updates running inbounds, recreating those without native user updates.
 func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -522,7 +525,7 @@ func (s *SingBox) RemoveUsers(users []model.UserSpec) (int, error) {
 	return removed, nil
 }
 
-// UpdateUsers replaces the entire user set atomically via hot-swap.
+// UpdateUsers replaces the user set, recreating inbounds without native user updates.
 func (s *SingBox) UpdateUsers(users []model.UserSpec) (added, removed int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -583,7 +586,8 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 	for _, inb := range opts.Inbounds {
 		tag := inb.Tag
 		if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-			var err error
+			// Mieru and other non-updatable inbounds must reach the recreation fallback.
+			err := fmt.Errorf("inbound %s does not support user updates", inb.Type)
 			switch v := existing.(type) {
 			case adapter.UpdatableInbound[option.VMessUser]:
 				if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
@@ -634,6 +638,9 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		}
 
 		_ = im.Remove(tag)
+		if err := waitForMieruUDPRelease(s.ctx, inb); err != nil {
+			return err
+		}
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
 		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
 			return fmt.Errorf("recreate inbound %s: %w", tag, err)
@@ -646,6 +653,45 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
 	return nil
+}
+
+// Mieru closes its UDP socket asynchronously after Stop returns, while its
+// next Start silently ignores bind failures. Probe the same dual-stack wildcard
+// binding before recreating the native inbound.
+func waitForMieruUDPRelease(ctx context.Context, inbound option.Inbound) error {
+	opts, ok := inbound.Options.(*option.MieruInboundOptions)
+	if !ok || opts.Transport != "UDP" {
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	listener := net.ListenConfig{}
+	address := net.JoinHostPort(mieruCommon.AllIPAddr(), fmt.Sprint(opts.ListenPort))
+	wakeSent := false
+	for {
+		conn, err := listener.ListenPacket(ctx, "udp", address)
+		if err == nil {
+			return conn.Close()
+		}
+		if !wakeSent {
+			wakeSent = true
+			// A pending read can overwrite Stop's deadline with a 60-120s timeout.
+			// Wake it locally so it observes the closed state and releases the socket.
+			wake, wakeErr := net.Dial("udp", net.JoinHostPort("127.0.0.1", fmt.Sprint(opts.ListenPort)))
+			if wakeErr == nil {
+				_, _ = wake.Write([]byte{0})
+				_ = wake.Close()
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for Mieru UDP port %d: %w (last bind error: %v)", opts.ListenPort, ctx.Err(), err)
+		case <-ticker.C:
+		}
+	}
 }
 
 // ─── Observability ──────────────────────────────────────────────────────────
