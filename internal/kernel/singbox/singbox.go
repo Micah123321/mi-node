@@ -642,7 +642,8 @@ func waitForMieruPortRelease(ctx context.Context, inbound option.Inbound) error 
 
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	ticker := time.NewTicker(time.Millisecond)
+	// A 1ms retry loop can consume a full CPU core while Mieru drains a socket.
+	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	listener := net.ListenConfig{}
 	address := net.JoinHostPort(mieruCommon.AllIPAddr(), fmt.Sprint(opts.ListenPort))
