@@ -137,6 +137,28 @@ type apiBackoff struct {
 	skipRemaining int
 }
 
+func cancellationOnly(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !cancellationOnly(child) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped := errors.Unwrap(err); wrapped != nil {
+		return cancellationOnly(wrapped)
+	}
+	return err == context.Canceled
+}
+
 func positiveSecondsOrDefault(v, fallback int) time.Duration {
 	if v <= 0 {
 		v = fallback
@@ -219,8 +241,15 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 }
 
 func (s *Service) Run(ctx context.Context) (runErr error) {
+	parentCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
+	enteredLoop := false
 	defer func() {
+		// Reload can retire a sibling while it is still starting. Only its pure
+		// cancellation is normal; real startup and final-report failures survive.
+		if !enteredLoop && parentCtx.Err() == context.Canceled && cancellationOnly(runErr) {
+			runErr = nil
+		}
 		cancel()
 		if panel.IsNodeRemoved(runErr) {
 			s.reportMu.Lock()
@@ -279,6 +308,7 @@ func (s *Service) Run(ctx context.Context) (runErr error) {
 	defer wsDiscoveryTicker.Stop()
 
 	s.startWSClient(ctx)
+	enteredLoop = true
 
 	for {
 		// A nil machine snapshot is not initialized, even when its WS loop is running.

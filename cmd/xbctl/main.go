@@ -939,60 +939,58 @@ func instanceMode(inst config.Config) string {
 }
 
 func collectInstanceRows() ([]instanceRow, error) {
-	rows, err := collectRowsFromMeta()
-	if err == nil && len(rows) > 0 {
-		return rows, nil
-	}
-	return collectRowsFromConfig()
+	return collectInstanceRowsAt(defaultConfigPath, defaultMetaPath, serviceState(), healthStatus())
 }
 
-func collectRowsFromMeta() ([]instanceRow, error) {
-	meta, err := loadInstallMeta(defaultMetaPath)
+func collectInstanceRowsAt(configPath, metaPath, serviceStatus, healthStatus string) ([]instanceRow, error) {
+	rows, err := collectRowsFromConfigAt(configPath, serviceStatus, healthStatus)
+	// The installer summary is only a fallback for a missing config. A valid
+	// empty config is authoritative; invalid YAML must not resurrect stale rows.
+	if !errors.Is(err, os.ErrNotExist) {
+		return rows, err
+	}
+	meta, err := loadInstallMeta(metaPath)
 	if err != nil {
 		return nil, err
 	}
-	serviceStatus := serviceState()
-	healthStatus := healthStatus()
-	rows := make([]instanceRow, 0, len(meta.Instances))
+	rows = make([]instanceRow, 0, len(meta.Instances))
 	for _, inst := range meta.Instances {
-		rows = append(rows, instanceRow{
-			ID:      inst.ID,
-			Mode:    inst.Mode,
-			Panel:   inst.PanelURL,
-			Target:  formatTarget(inst.NodeID, inst.MachineID),
-			Service: serviceStatus,
-			Health:  healthStatus,
-		})
+		rows = append(rows, instanceRow{ID: inst.ID, Mode: inst.Mode, Panel: inst.PanelURL,
+			Target: formatTarget(inst.NodeID, inst.MachineID), Service: serviceStatus, Health: healthStatus})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows, nil
 }
 
-func collectRowsFromConfig() ([]instanceRow, error) {
-	root, err := config.LoadRoot(defaultConfigPath)
+func collectRowsFromConfigAt(path, serviceStatus, healthStatus string) ([]instanceRow, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	instances, err := root.NormalizeInstances()
-	if err != nil {
+	var root config.RootConfig
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	var shape map[string]yaml.Node
+	if err := yaml.Unmarshal(data, &shape); err != nil {
 		return nil, err
 	}
-	serviceStatus := serviceState()
-	healthStatus := healthStatus()
-	rows := make([]instanceRow, 0, len(instances))
+	rows := make([]instanceRow, 0)
+	if list, ok := shape["instances"]; ok && list.Kind == yaml.SequenceNode && len(list.Content) == 0 {
+		return rows, nil
+	}
+	// Listing bindings does not require loading service-only credential env vars.
+	instances := normalizeRootInstances(&root)
 	for _, inst := range instances {
-		mode := "node"
-		if inst.IsMachineMode() {
-			mode = "machine"
+		id := inst.InstanceID
+		if id == "" {
+			id, err = inst.AutoInstanceID()
+			if err != nil {
+				return nil, err
+			}
 		}
-		rows = append(rows, instanceRow{
-			ID:      inst.InstanceID,
-			Mode:    mode,
-			Panel:   inst.Panel.URL,
-			Target:  formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(inst)),
-			Service: serviceStatus,
-			Health:  healthStatus,
-		})
+		rows = append(rows, instanceRow{ID: id, Mode: instanceMode(inst), Panel: inst.Panel.URL,
+			Target: formatTarget(intPtr(inst.Panel.NodeID), machineIDPtr(&inst)), Service: serviceStatus, Health: healthStatus})
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].ID < rows[j].ID })
 	return rows, nil
