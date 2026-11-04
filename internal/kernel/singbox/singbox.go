@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"sync"
@@ -45,6 +46,7 @@ type SingBox struct {
 	users      []model.UserSpec
 	nodeConfig *model.NodeSpec
 	tls        kernel.TLSCert
+	inbounds   []option.Inbound
 
 	// connTracker is our lightweight in-process byte/IP tracker.
 	// Shared across instances so draining old connections keep contributing
@@ -166,6 +168,7 @@ func (s *SingBox) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls 
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.tls = tls
+	s.inbounds = opts.Inbounds
 
 	s.trackerRegistered = true
 	s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
@@ -247,87 +250,22 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 		return fmt.Errorf("router not available")
 	}
 
-	// Update routing rules
+	// Protocol changes also change the tag; replace the previously applied listeners.
+	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
+	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
+	if configChanged {
+		if err := s.replaceInboundsLocked(im, router, opts.Inbounds); err != nil {
+			return err
+		}
+	} else if err := s.reloadInboundsLocked(users); err != nil {
+		return err
+	}
+
+	// Keep the old routes usable if listener replacement failed and rolled back.
 	if err := router.UpdateRules(opts.Route.Rules, opts.Route.RuleSet); err != nil {
 		nlog.Core().Debug("routing reload failed", "error", err)
 	} else {
 		nlog.Core().Debug("sing-box routing reloaded")
-	}
-
-	nopFactory := singLog.NewNOPFactory()
-
-	// Configuration hash check for inbound reconstruction
-	tlsChanged := !bytes.Equal(s.tls.CertPEM, tls.CertPEM) || !bytes.Equal(s.tls.KeyPEM, tls.KeyPEM)
-	configChanged := tlsChanged || s.nodeConfig == nil || kernel.ComputeHash(nodeConfig, users) != kernel.ComputeHash(s.nodeConfig, s.users)
-
-	for _, inb := range opts.Inbounds {
-		tag := inb.Tag
-		if !configChanged {
-			if existing, ok := im.Get(tag); ok && existing.Type() == inb.Type {
-				var err error
-				switch v := existing.(type) {
-				case adapter.UpdatableInbound[option.VMessUser]:
-					if opts, ok := inb.Options.(*option.VMessInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.VLESSUser]:
-					if opts, ok := inb.Options.(*option.VLESSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TrojanUser]:
-					if opts, ok := inb.Options.(*option.TrojanInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.Hysteria2User]:
-					if opts, ok := inb.Options.(*option.Hysteria2InboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableShadowsocksInbound:
-					if opts, ok := inb.Options.(*option.ShadowsocksInboundOptions); ok {
-						err = v.UpdateUsersByOptions(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.TUICUser]:
-					if opts, ok := inb.Options.(*option.TUICInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.AnyTLSUser]:
-					if opts, ok := inb.Options.(*option.AnyTLSInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[option.MieruUser]:
-					if opts, ok := inb.Options.(*option.MieruInboundOptions); ok {
-						err = v.UpdateUsers(opts.Users)
-					}
-				case adapter.UpdatableInbound[auth.User]:
-					switch opts := inb.Options.(type) {
-					case *option.NaiveInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.SocksInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					case *option.HTTPMixedInboundOptions:
-						err = v.UpdateUsers(opts.Users)
-					}
-				}
-				if err == nil {
-					continue
-				}
-				nlog.Core().Warn("incremental update failed, falling back to recreate", "tag", tag, "error", err)
-			}
-		}
-
-		// Config mismatch or incremental update failure: Reconstruct Inbound.
-		// Remove the existing inbound first so im.Create() can bind the same port.
-		// im.Create() cannot atomically swap a TCP listener — it tries to start the
-		// new socket before the old one is closed, causing "address already in use".
-		// Mieru UDP may finish closing its socket on a separate goroutine.
-		_ = im.Remove(tag) // ignore error when tag doesn't exist yet
-		if err := waitForMieruUDPRelease(s.ctx, inb); err != nil {
-			return err
-		}
-		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
-		if err := im.Create(s.ctx, router, logger, tag, inb.Type, inb.Options); err != nil {
-			return fmt.Errorf("recreate inbound %s: %w", tag, err)
-		}
 	}
 
 	// Trackers remain registered on the Router (which survives ReloadUsers).
@@ -340,6 +278,44 @@ func (s *SingBox) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls
 	s.users = users
 	s.nodeConfig = nodeConfig
 	s.tls = tls
+	return nil
+}
+
+// replaceInboundsLocked releases old tags and restores them if replacement fails.
+func (s *SingBox) replaceInboundsLocked(im adapter.InboundManager, router adapter.Router, next []option.Inbound) error {
+	previous := s.inbounds
+	nopFactory := singLog.NewNOPFactory()
+	apply := func(from, to []option.Inbound) error {
+		for _, inb := range from {
+			if _, exists := im.Get(inb.Tag); !exists {
+				continue
+			}
+			if err := im.Remove(inb.Tag); err != nil {
+				return fmt.Errorf("remove inbound %s: %w", inb.Tag, err)
+			}
+			if err := waitForMieruPortRelease(s.ctx, inb); err != nil {
+				return err
+			}
+		}
+		for _, inb := range to {
+			// Mieru's native server can report success before a failed bind surfaces.
+			if err := waitForMieruPortRelease(s.ctx, inb); err != nil {
+				return err
+			}
+			logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, inb.Tag))
+			if err := im.Create(s.ctx, router, logger, inb.Tag, inb.Type, inb.Options); err != nil {
+				return fmt.Errorf("recreate inbound %s: %w", inb.Tag, err)
+			}
+		}
+		return nil
+	}
+	if err := apply(previous, next); err != nil {
+		if rollbackErr := apply(next, previous); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore previous inbounds: %w", rollbackErr))
+		}
+		return err
+	}
+	s.inbounds = next
 	return nil
 }
 
@@ -638,7 +614,7 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		}
 
 		_ = im.Remove(tag)
-		if err := waitForMieruUDPRelease(s.ctx, inb); err != nil {
+		if err := waitForMieruPortRelease(s.ctx, inb); err != nil {
 			return err
 		}
 		logger := nopFactory.NewLogger(fmt.Sprintf("inbound/%s[%s]", inb.Type, tag))
@@ -651,16 +627,16 @@ func (s *SingBox) reloadInboundsLocked(users []model.UserSpec) error {
 		s.connTracker.SetUserMap(buildUserMap(users), buildAccountMap(users))
 	}
 
+	s.inbounds = opts.Inbounds
 	nlog.Core().Debug("sing-box users hot-swapped", "users", len(users))
 	return nil
 }
 
-// Mieru closes its UDP socket asynchronously after Stop returns, while its
-// next Start silently ignores bind failures. Probe the same dual-stack wildcard
-// binding before recreating the native inbound.
-func waitForMieruUDPRelease(ctx context.Context, inbound option.Inbound) error {
+// Mieru closes UDP sockets asynchronously and can silently ignore bind failures.
+// Probe the native server's wildcard binding before starting its replacement.
+func waitForMieruPortRelease(ctx context.Context, inbound option.Inbound) error {
 	opts, ok := inbound.Options.(*option.MieruInboundOptions)
-	if !ok || opts.Transport != "UDP" {
+	if !ok {
 		return nil
 	}
 
@@ -672,11 +648,21 @@ func waitForMieruUDPRelease(ctx context.Context, inbound option.Inbound) error {
 	address := net.JoinHostPort(mieruCommon.AllIPAddr(), fmt.Sprint(opts.ListenPort))
 	wakeSent := false
 	for {
-		conn, err := listener.ListenPacket(ctx, "udp", address)
-		if err == nil {
-			return conn.Close()
+		var err error
+		if opts.Transport == "UDP" {
+			var conn net.PacketConn
+			conn, err = listener.ListenPacket(ctx, "udp", address)
+			if err == nil {
+				return conn.Close()
+			}
+		} else {
+			var conn net.Listener
+			conn, err = listener.Listen(ctx, "tcp", address)
+			if err == nil {
+				return conn.Close()
+			}
 		}
-		if !wakeSent {
+		if opts.Transport == "UDP" && !wakeSent {
 			wakeSent = true
 			// A pending read can overwrite Stop's deadline with a 60-120s timeout.
 			// Wake it locally so it observes the closed state and releases the socket.
@@ -688,7 +674,7 @@ func waitForMieruUDPRelease(ctx context.Context, inbound option.Inbound) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("wait for Mieru UDP port %d: %w (last bind error: %v)", opts.ListenPort, ctx.Err(), err)
+			return fmt.Errorf("wait for Mieru %s port %d: %w (last bind error: %v)", opts.Transport, opts.ListenPort, ctx.Err(), err)
 		case <-ticker.C:
 		}
 	}

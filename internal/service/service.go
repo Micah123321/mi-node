@@ -68,10 +68,11 @@ type Service struct {
 	pushInterval int // seconds
 	pullInterval int // seconds
 
-	lastUserHash   string     // hash of user list for change detection
-	lastConfigHash string     // hash of protocol settings for change detection
-	pullBackoff    apiBackoff // backoff for panel pull failures
-	pushBackoff    apiBackoff // backoff for panel push failures
+	lastUserHash       string     // hash of user list for change detection
+	lastConfigHash     string     // hash of protocol settings for change detection
+	configApplyPending bool       // retry a config that has not reached the kernel
+	pullBackoff        apiBackoff // backoff for panel pull failures
+	pushBackoff        apiBackoff // backoff for panel push failures
 
 	// pushActive prevents overlapping push/pull goroutines.
 	pushActive        atomic.Bool
@@ -289,10 +290,15 @@ func (s *Service) Run(ctx context.Context) error {
 
 		case <-pullTicker.C:
 			// Push normally replaces polling, but a stale response requires reconciliation.
-			if s.wsClient != nil && s.wsClient.IsConnected() && !s.wsResyncPending.Load() {
+			if s.wsClient != nil && s.wsClient.IsConnected() && !s.wsResyncPending.Load() && !s.configApplyPending {
 				continue
 			}
-			nlog.Core().Debug("polling from API (ws not connected)")
+			if s.configApplyPending {
+				if source, ok := s.source.(interface{ RequestResync() }); ok {
+					source.RequestResync()
+				}
+			}
+			nlog.Core().Debug("polling from API for reconciliation")
 			s.pullViaAPIAsync(ctx)
 
 		case state := <-s.bandwidthStates:
@@ -941,7 +947,8 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 			s.wsResyncPending.Store(true)
 		}
 	}
-	configChanged := false
+	// A 304 response must still retry a configuration whose kernel apply failed.
+	configChanged := s.configApplyPending
 
 	if result.config != nil && s.applyConfigUpdate(ctx, result.config, result.configHash) {
 		configChanged = true
@@ -978,8 +985,8 @@ func (s *Service) applyConfigUpdate(ctx context.Context, nc *model.NodeSpec, con
 	if configHash == "" {
 		configHash = computeConfigHash(nc)
 	}
-	configChanged := configHash != s.lastConfigHash
-	if s.nodeLog == nil {
+	configChanged := configHash != s.lastConfigHash || s.configApplyPending
+	if s.nodeLog == nil || s.lastConfig == nil || s.lastConfig.Protocol != nc.Protocol || s.lastConfig.ServerPort != nc.ServerPort {
 		s.nodeLog = nlog.ForNode(nc.Protocol, nc.ServerPort)
 	}
 	s.metricsMu.Lock()
@@ -1058,6 +1065,7 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
+	s.configApplyPending = false
 
 	slog.Info("kernel started successfully",
 		"node_id", s.cfg.Panel.NodeID,
@@ -1292,6 +1300,8 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 		return
 	}
 
+	s.configApplyPending = true
+
 	// If config changed, delegate to kernel.Reload. The kernel implementation
 	// decides whether to hot-swap users, reconstruct inbounds, or restart itself.
 	if configChanged && s.kernel.IsRunning() {
@@ -1300,11 +1310,15 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 			return
 		}
 		if err := s.kernel.Reload(s.lastConfig, s.lastUsers, s.cert.TLSCert()); err != nil {
-			nlog.Core().Warn(fmt.Sprintf("reload failed, restarting: %v", err))
-			s.startKernel(s.lastConfig, s.lastUsers)
+			nlog.Core().Warn("config reload failed; scheduling retry", "error", err)
+			// A kernel that restored its old listeners must keep serving them.
+			if !s.kernel.IsRunning() {
+				s.startKernel(s.lastConfig, s.lastUsers)
+			}
 		} else {
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
+			s.configApplyPending = false
 			s.logShadowsocksEgressStatus("reload")
 			s.triggerShadowsocksEgressProbe("reload")
 		}
