@@ -34,6 +34,8 @@ func NewPanelControlPlane(panelCfg config.PanelConfig, wsCfg config.WSConfig, kc
 	}
 }
 
+func (p *PanelControlPlane) CheckNode(ctx context.Context) error { return p.client.CheckNode(ctx) }
+
 func (p *PanelControlPlane) SupportsPolling() bool       { return true }
 func (p *PanelControlPlane) SupportsDiscovery() bool     { return true }
 func (p *PanelControlPlane) SupportsReporting() bool     { return true }

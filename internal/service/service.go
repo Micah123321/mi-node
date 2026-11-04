@@ -33,6 +33,7 @@ import (
 	"github.com/micah123321/mi-node/internal/model"
 	"github.com/micah123321/mi-node/internal/monitor"
 	"github.com/micah123321/mi-node/internal/nlog"
+	"github.com/micah123321/mi-node/internal/panel"
 	"github.com/micah123321/mi-node/internal/readiness"
 	"github.com/micah123321/mi-node/internal/tracker"
 	"github.com/micah123321/mi-node/internal/trafficlimit"
@@ -127,6 +128,7 @@ type pullResult struct {
 	baseUserHash   string
 	stateCaptured  bool
 	resyncRevision uint64
+	err            error
 }
 
 // apiBackoff implements simple exponential backoff for API failures.
@@ -216,7 +218,20 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	}
 }
 
-func (s *Service) Run(ctx context.Context) error {
+func (s *Service) Run(ctx context.Context) (runErr error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		cancel()
+		if panel.IsNodeRemoved(runErr) {
+			s.reportMu.Lock()
+			s.reportStopping = true
+			s.reportMu.Unlock()
+			s.reportWG.Wait()
+		}
+	}()
+	if err := s.checkNode(ctx); panel.IsNodeRemoved(err) {
+		return err
+	}
 	readyKey := readiness.Key(s.cfg.InstanceID, s.cfg.Panel.URL, s.cfg.Panel.NodeID)
 	readiness.Set(ctx, readyKey, false)
 	defer readiness.Set(ctx, readyKey, false)
@@ -291,6 +306,7 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-pullTicker.C:
 			// Push normally replaces polling, but a stale response requires reconciliation.
 			if s.wsClient != nil && s.wsClient.IsConnected() && !s.wsResyncPending.Load() && !s.configApplyPending {
+				s.checkNodeAsync(ctx)
 				continue
 			}
 			if s.configApplyPending {
@@ -305,6 +321,9 @@ func (s *Service) Run(ctx context.Context) error {
 			s.applyBandwidthState(state)
 
 		case result := <-s.pullResults:
+			if result.err != nil {
+				return result.err
+			}
 			s.applyPullResult(ctx, result)
 
 		case <-wsDiscoveryTicker.C:
@@ -872,6 +891,32 @@ func (s *Service) runGFWCheckAsync(parent context.Context, task *gfwcheck.Task) 
 	}()
 }
 
+// The lightweight V2 existence check also runs while push replaces REST polling.
+func (s *Service) checkNode(ctx context.Context) error {
+	if source, ok := s.source.(interface{ CheckNode(context.Context) error }); ok {
+		return source.CheckNode(ctx)
+	}
+	return nil
+}
+
+func (s *Service) checkNodeAsync(ctx context.Context) {
+	if _, ok := s.source.(interface{ CheckNode(context.Context) error }); !ok {
+		return
+	}
+	if !s.pullActive.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.pullActive.Store(false)
+		if err := s.checkNode(ctx); panel.IsNodeRemoved(err) {
+			select {
+			case s.pullResults <- pullResult{err: err}:
+			case <-ctx.Done():
+			}
+		}
+	}()
+}
+
 // pullViaAPIAsync fetches config/users from the panel API in a background
 // goroutine and sends the result to pullResults for the main goroutine to apply.
 func (s *Service) pullViaAPIAsync(ctx context.Context) {
@@ -893,8 +938,21 @@ func (s *Service) pullViaAPIAsync(ctx context.Context) {
 	resyncRevision := s.wsResyncRevision
 
 	go func() {
-		snapshot, err := s.source.Poll(ctx)
+		var snapshot controlplane.Snapshot
+		err := s.checkNode(ctx)
+		if !panel.IsNodeRemoved(err) {
+			snapshot, err = s.source.Poll(ctx)
+		}
 		if err != nil {
+			var removed *panel.NodeRemovedError
+			if errors.As(err, &removed) {
+				select {
+				case s.pullResults <- pullResult{err: err}:
+				case <-ctx.Done():
+				}
+				s.pullActive.Store(false)
+				return
+			}
 			nlog.Core().Error("poll control plane failed", "error", err)
 			s.pullBackoff.onFailure()
 			s.pullActive.Store(false)

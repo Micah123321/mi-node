@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -117,8 +118,9 @@ func main() {
 		os.Exit(1)
 	}
 	if len(instances) == 0 {
-		fmt.Fprintln(os.Stderr, "no runnable instances configured")
-		os.Exit(1)
+		config.InitLogger(rootCfg.Config.Log)
+		runWithReload(rootCfg, *configPath)
+		return
 	}
 
 	config.InitLogger(instances[0].Log)
@@ -216,8 +218,21 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		if len(instances) == 0 {
-			nlog.Core().Error("no runnable instances configured")
-			os.Exit(1)
+			closeHealth()
+			closeDebug()
+			idleCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+			nlog.Core().Info("no node bindings; waiting for configuration")
+			next, err := waitForNodeBindings(idleCtx, configPath)
+			stop()
+			if err != nil {
+				nlog.Core().Error("idle config watcher failed", "error", err)
+				return
+			}
+			if next == nil {
+				return
+			}
+			root = next
+			continue
 		}
 		if err := config.ValidateStartupLayout(instances); err != nil {
 			nlog.Core().Error("startup layout validation failed", "error", err)
@@ -352,16 +367,32 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 							}
 						}
 						if err := svc.Run(ctx); err != nil {
-							nlog.Core().Error("node service exited with error",
-								"instance", nodeCfg.InstanceID,
-								"node_id", nodeCfg.Panel.NodeID,
-								"error", err,
-							)
-							select {
-							case errCh <- err:
-							default:
-							} // Retain at least one failure without blocking other shutdowns.
-							cancel()
+							var removed *panel.NodeRemovedError
+							if errors.As(err, &removed) {
+								if cleanupErr := removeDeletedNodeBinding(configPath, nodeCfg); cleanupErr != nil {
+									nlog.Core().Error("failed to remove deleted node binding",
+										"node_id", nodeCfg.Panel.NodeID, "error", cleanupErr)
+									select {
+									case errCh <- cleanupErr:
+									default:
+									}
+									cancel()
+								} else {
+									nlog.Core().Info("panel node deleted; local binding removed",
+										"instance", nodeCfg.InstanceID, "node_id", nodeCfg.Panel.NodeID)
+								}
+							} else {
+								nlog.Core().Error("node service exited with error",
+									"instance", nodeCfg.InstanceID,
+									"node_id", nodeCfg.Panel.NodeID,
+									"error", err,
+								)
+								select {
+								case errCh <- err:
+								default:
+								} // Retain at least one failure without blocking other shutdowns.
+								cancel()
+							}
 						} else {
 							nlog.Core().Info("node service stopped",
 								"instance", nodeCfg.InstanceID,
@@ -390,6 +421,7 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 		case <-doneCh:
 		}
 
+		wasStopping := ctx.Err() != nil
 		signal.Stop(sigCh)
 		if watcher != nil {
 			watcher.Stop()
@@ -401,6 +433,12 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			os.Exit(1)
 		}
 		if newRoot == nil {
+			if current, err := config.LoadRoot(configPath); !wasStopping && err == nil {
+				if active, err := current.NormalizeInstances(); err == nil && len(active) == 0 {
+					root = current
+					continue
+				}
+			}
 			nlog.Core().Info("mi-node stopped")
 			return
 		}
@@ -410,12 +448,10 @@ func runWithReload(initialRoot *config.RootConfig, configPath string) {
 			nlog.Core().Error("failed to normalize reloaded config", "error", err)
 			os.Exit(1)
 		}
-		if len(newInstances) == 0 {
-			nlog.Core().Error("no runnable instances configured after reload")
-			os.Exit(1)
+		if len(newInstances) > 0 {
+			config.InitLogger(newInstances[0].Log)
+			applyRuntimeConfig(newInstances[0].Runtime)
 		}
-		config.InitLogger(newInstances[0].Log)
-		applyRuntimeConfig(newInstances[0].Runtime)
 		root = newRoot
 		nlog.Core().Info("reload complete, services restarting with new config")
 	}

@@ -191,8 +191,9 @@ type LogConfig struct {
 }
 
 type RootConfig struct {
-	Instances []Config `yaml:"instances,omitempty"`
-	Config    `yaml:",inline"`
+	emptyInstances bool
+	Instances      []Config `yaml:"instances,omitempty"`
+	Config         `yaml:",inline"`
 }
 
 func LoadRoot(path string) (*RootConfig, error) {
@@ -202,6 +203,14 @@ func LoadRoot(path string) (*RootConfig, error) {
 	if err == nil {
 		if err := yaml.Unmarshal(data, rc); err != nil {
 			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		var shape map[string]yaml.Node
+		if err := yaml.Unmarshal(data, &shape); err != nil {
+			return nil, err
+		}
+		if list, ok := shape["instances"]; ok && list.Kind == yaml.SequenceNode && len(list.Content) == 0 {
+			rc.emptyInstances = true
+			return rc, nil
 		}
 		if len(rc.Instances) == 0 {
 			legacy := &Config{}
@@ -335,6 +344,9 @@ func (rc *RootConfig) validateRoot() error {
 }
 
 func (rc *RootConfig) NormalizeInstances() ([]*Config, error) {
+	if rc.emptyInstances && len(rc.Instances) == 0 {
+		return []*Config{}, nil
+	}
 	if len(rc.Instances) == 0 {
 		id, err := rc.Config.AutoInstanceID()
 		if err != nil {
