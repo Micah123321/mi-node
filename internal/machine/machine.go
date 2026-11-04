@@ -6,6 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,6 +115,7 @@ func (o *Orchestrator) Run(ctx context.Context) error {
 	o.tryStartWS(ctx)
 
 	// Start initial nodes.
+	o.cleanupStaleNodeData(nodesResp.Nodes)
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n)
 	}
@@ -285,11 +290,68 @@ func (o *Orchestrator) rediscover(ctx context.Context) {
 
 	for _, id := range toRemove {
 		o.stopNode(id)
+		o.removeNodeData(id)
 		readiness.Remove(ctx, readiness.Key(o.cfg.InstanceID, o.cfg.Panel.URL, id))
 	}
 
+	o.cleanupStaleNodeData(nodesResp.Nodes)
 	for _, n := range nodesResp.Nodes {
 		o.startNode(ctx, n) // no-op if already running
+	}
+}
+
+// removeNodeData deletes only the private directory derived for a removed panel node.
+// It runs after the service has stopped so final reports and state writes finish first.
+func (o *Orchestrator) removeNodeData(nodeID int) {
+	dir := o.cfg.MachineNodeConfigDir(nodeID)
+	if dir == "" {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		nlog.Core().Warn("machine node data cleanup failed", "node_id", nodeID, "dir", dir, "error", err)
+		return
+	}
+	nlog.Core().Info("machine removed deleted node data", "node_id", nodeID, "dir", dir)
+}
+
+// cleanupStaleNodeData also handles directories left by a previous process run.
+// Only generated node-<positive integer> directories are candidates; shared machine
+// data and unrelated files remain untouched.
+func (o *Orchestrator) cleanupStaleNodeData(nodes []panel.MachineNode) {
+	base := strings.TrimSpace(o.cfg.Kernel.ConfigDir)
+	if base == "" {
+		return
+	}
+	wanted := make(map[int]struct{}, len(nodes))
+	for _, node := range nodes {
+		if node.ID > 0 {
+			wanted[node.ID] = struct{}{}
+		}
+	}
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			nlog.Core().Warn("machine stale node scan failed", "dir", base, "error", err)
+		}
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "node-") {
+			continue
+		}
+		id, err := strconv.Atoi(strings.TrimPrefix(entry.Name(), "node-"))
+		if err != nil || id <= 0 {
+			continue
+		}
+		if _, keep := wanted[id]; keep {
+			continue
+		}
+		dir := filepath.Join(base, entry.Name())
+		if err := os.RemoveAll(dir); err != nil {
+			nlog.Core().Warn("machine stale node data cleanup failed", "node_id", id, "dir", dir, "error", err)
+			continue
+		}
+		nlog.Core().Info("machine removed stale node data", "node_id", id, "dir", dir)
 	}
 }
 

@@ -386,6 +386,8 @@ instances:
       config_dir: "/etc/mi-node/instances/panel-b-machine-100"
 ```
 
+machine 模式会根据面板返回的节点清单动态创建 `kernel.config_dir/node-<node_id>`。面板删除节点后，mi-node 会先停止该节点服务，再删除对应目录中的证书、缓存、流量状态和上报队列；进程重启后的首次发现也会清理已失效的 `node-*` 目录，机器公共目录和仍存在的节点目录会保留。
+
 如果需要默认经 SOCKS5 出站，可以增加：
 
 ```yaml

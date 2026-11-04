@@ -892,6 +892,16 @@ func (c *Config) ExpandNodes() []*Config {
 	return result
 }
 
+// MachineNodeConfigDir returns the private runtime directory for one dynamically discovered node.
+// It is deliberately derived from the machine base directory so deleted panel nodes
+// can have their cached certificates, state, and queues removed safely.
+func (c *Config) MachineNodeConfigDir(nodeID int) string {
+	if c == nil || nodeID <= 0 || strings.TrimSpace(c.Kernel.ConfigDir) == "" {
+		return ""
+	}
+	return filepath.Join(strings.TrimSpace(c.Kernel.ConfigDir), fmt.Sprintf("node-%d", nodeID))
+}
+
 func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	nodeCfg := *c
 	nodeCfg.Nodes = nil
@@ -900,7 +910,7 @@ func (c *Config) ExpandMachineNode(nodeID int, nodeType string) *Config {
 	nodeCfg.Panel.Token = c.Machine.Token
 	nodeCfg.Panel.MachineID = c.Machine.MachineID
 
-	nodeCfg.Kernel.ConfigDir = fmt.Sprintf("%s/node-%d", c.Kernel.ConfigDir, nodeID)
+	nodeCfg.Kernel.ConfigDir = c.MachineNodeConfigDir(nodeID)
 	if nodeCfg.Kernel.GeoDataDir == c.Kernel.ConfigDir {
 		nodeCfg.Kernel.GeoDataDir = c.Kernel.GeoDataDir
 	}
